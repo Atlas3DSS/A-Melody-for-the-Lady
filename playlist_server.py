@@ -276,21 +276,28 @@ class Handler(BaseHTTPRequestHandler):
         output_dir = app_state["output_dir"]
 
         try:
-            # WSL — use explorer.exe
-            if "microsoft" in platform.uname().release.lower():
+            system = platform.system()
+            is_wsl = system == "Linux" and "microsoft" in platform.uname().release.lower()
+
+            if is_wsl:
                 if target_file:
                     win_path = _subprocess.run(
                         ["wslpath", "-w", str(target_file)],
                         capture_output=True, text=True
                     ).stdout.strip()
-                    _subprocess.Popen(["explorer.exe", "/select,", win_path])
+                    _subprocess.Popen(["explorer.exe", f"/select,{win_path}"])
                 else:
                     win_path = _subprocess.run(
                         ["wslpath", "-w", str(output_dir)],
                         capture_output=True, text=True
                     ).stdout.strip()
                     _subprocess.Popen(["explorer.exe", win_path])
-            elif platform.system() == "Darwin":
+            elif system == "Windows":
+                if target_file:
+                    _subprocess.Popen(f'explorer /select,"{target_file}"', shell=True)
+                else:
+                    _subprocess.Popen(["explorer", str(output_dir)])
+            elif system == "Darwin":
                 if target_file:
                     _subprocess.Popen(["open", "-R", str(target_file)])
                 else:
