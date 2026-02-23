@@ -268,53 +268,58 @@ class Handler(BaseHTTPRequestHandler):
             self._json_response({"error": str(exc)}, 500)
 
     def _api_open_folder(self):
-        """Open the download folder in the OS file manager, highlighting a file if given."""
-        body = self._read_json_body()
-        video_id = body.get("id")
-
-        target_file = find_audio_file(video_id) if video_id else None
-        output_dir = app_state["output_dir"]
+        """Open the download folder in the OS file manager. Tries multiple methods."""
+        output_dir = str(app_state["output_dir"])
+        system = platform.system()
+        opened = False
 
         try:
-            system = platform.system()
-            is_wsl = system == "Linux" and "microsoft" in platform.uname().release.lower()
-
-            if is_wsl:
-                if target_file:
-                    win_path = _subprocess.run(
-                        ["wslpath", "-w", str(target_file)],
-                        capture_output=True, text=True
-                    ).stdout.strip()
-                else:
-                    win_path = _subprocess.run(
-                        ["wslpath", "-w", str(output_dir)],
-                        capture_output=True, text=True
-                    ).stdout.strip()
-                # explorer.exe on WSL needs full path and shell command
-                _subprocess.Popen(
-                    f'/mnt/c/Windows/explorer.exe /select,"{win_path}"',
-                    shell=True
-                )
-            elif system == "Windows":
+            if system == "Windows":
                 import os
-                if target_file:
-                    # Use native Windows API — most reliable way
-                    win_path = str(target_file).replace("/", "\\")
-                    _subprocess.run(
-                        f'explorer /select,"{win_path}"',
-                        shell=True
-                    )
-                else:
-                    os.startfile(str(output_dir))
+                os.startfile(output_dir)
+                opened = True
             elif system == "Darwin":
-                if target_file:
-                    _subprocess.Popen(["open", "-R", str(target_file)])
-                else:
-                    _subprocess.Popen(["open", str(output_dir)])
+                _subprocess.Popen(["open", output_dir])
+                opened = True
             else:
-                _subprocess.Popen(["xdg-open", str(output_dir)])
+                # Linux / WSL — try methods in order of reliability
+                for cmd in ["xdg-open", "wslview", "nautilus", "dolphin", "thunar", "nemo"]:
+                    try:
+                        _subprocess.Popen([cmd, output_dir],
+                                          stdout=_subprocess.DEVNULL,
+                                          stderr=_subprocess.DEVNULL)
+                        opened = True
+                        break
+                    except FileNotFoundError:
+                        continue
 
-            self._json_response({"ok": True})
+                # Last resort for WSL: find explorer.exe and convert path
+                if not opened:
+                    try:
+                        win_path = _subprocess.run(
+                            ["wslpath", "-w", output_dir],
+                            capture_output=True, text=True
+                        ).stdout.strip()
+                        if win_path:
+                            explorer = _subprocess.run(
+                                ["which", "explorer.exe"],
+                                capture_output=True, text=True
+                            ).stdout.strip()
+                            if not explorer:
+                                # Search common locations
+                                for p in ["/mnt/c/Windows/explorer.exe", "/mnt/c/WINDOWS/explorer.exe"]:
+                                    if Path(p).exists():
+                                        explorer = p
+                                        break
+                            if explorer:
+                                _subprocess.Popen([explorer, win_path],
+                                                  stdout=_subprocess.DEVNULL,
+                                                  stderr=_subprocess.DEVNULL)
+                                opened = True
+                    except FileNotFoundError:
+                        pass
+
+            self._json_response({"ok": opened, "path": output_dir})
         except Exception as exc:
             self._json_response({"error": str(exc)}, 500)
 
