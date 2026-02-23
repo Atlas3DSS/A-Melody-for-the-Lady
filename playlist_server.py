@@ -285,18 +285,27 @@ class Handler(BaseHTTPRequestHandler):
                         ["wslpath", "-w", str(target_file)],
                         capture_output=True, text=True
                     ).stdout.strip()
-                    _subprocess.Popen(["explorer.exe", f"/select,{win_path}"])
                 else:
                     win_path = _subprocess.run(
                         ["wslpath", "-w", str(output_dir)],
                         capture_output=True, text=True
                     ).stdout.strip()
-                    _subprocess.Popen(["explorer.exe", win_path])
+                # explorer.exe on WSL needs the whole thing as one shell command
+                _subprocess.Popen(
+                    f'explorer.exe /select,"{win_path}"',
+                    shell=True
+                )
             elif system == "Windows":
+                import os
                 if target_file:
-                    _subprocess.Popen(f'explorer /select,"{target_file}"', shell=True)
+                    # Use native Windows API — most reliable way
+                    win_path = str(target_file).replace("/", "\\")
+                    _subprocess.run(
+                        f'explorer /select,"{win_path}"',
+                        shell=True
+                    )
                 else:
-                    _subprocess.Popen(["explorer", str(output_dir)])
+                    os.startfile(str(output_dir))
             elif system == "Darwin":
                 if target_file:
                     _subprocess.Popen(["open", "-R", str(target_file)])
