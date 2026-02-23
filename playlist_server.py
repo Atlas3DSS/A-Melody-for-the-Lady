@@ -159,7 +159,7 @@ def find_file_by_id(video_id: str, extensions: tuple[str, ...]) -> Path | None:
 
 
 def find_audio_file(video_id: str) -> Path | None:
-    return find_file_by_id(video_id, ("opus", "m4a", "mp3", "ogg", "webm"))
+    return find_file_by_id(video_id, ("mp3", "opus", "m4a", "ogg", "webm"))
 
 
 def find_thumb_file(video_id: str) -> Path | None:
@@ -268,21 +268,44 @@ class Handler(BaseHTTPRequestHandler):
             self._json_response({"error": str(exc)}, 500)
 
     def _api_open_folder(self):
-        """Return the download folder path and try to open it in OS file manager."""
-        output_dir = str(app_state["output_dir"])
-        system = platform.system()
+        """Open the download folder in the OS file manager, highlighting a file if given."""
+        body = self._read_json_body()
+        video_id = body.get("id")
 
-        # Best-effort OS open — don't rely on this working
+        target_file = find_audio_file(video_id) if video_id else None
+        output_dir = app_state["output_dir"]
+
         try:
-            if system == "Windows":
-                import os
-                os.startfile(output_dir)
-            elif system == "Darwin":
-                _subprocess.Popen(["open", output_dir])
-        except Exception:
-            pass
+            # WSL — use explorer.exe
+            if "microsoft" in platform.uname().release.lower():
+                if target_file:
+                    win_path = _subprocess.run(
+                        ["wslpath", "-w", str(target_file)],
+                        capture_output=True, text=True
+                    ).stdout.strip()
+                    _subprocess.Popen(["explorer.exe", "/select,", win_path])
+                else:
+                    win_path = _subprocess.run(
+                        ["wslpath", "-w", str(output_dir)],
+                        capture_output=True, text=True
+                    ).stdout.strip()
+                    _subprocess.Popen(["explorer.exe", win_path])
+            elif platform.system() == "Darwin":
+                if target_file:
+                    _subprocess.Popen(["open", "-R", str(target_file)])
+                else:
+                    _subprocess.Popen(["open", str(output_dir)])
+            elif platform.system() == "Windows":
+                if target_file:
+                    _subprocess.Popen(["explorer.exe", "/select,", str(target_file)])
+                else:
+                    _subprocess.Popen(["explorer.exe", str(output_dir)])
+            else:
+                _subprocess.Popen(["xdg-open", str(output_dir)])
 
-        self._json_response({"path": output_dir})
+            self._json_response({"ok": True})
+        except Exception as exc:
+            self._json_response({"error": str(exc)}, 500)
 
     def _api_audio(self, video_id: str):
         """Serve audio file with HTTP Range support for seeking."""
@@ -949,29 +972,6 @@ input[type="checkbox"] {
 .wa-pl-remove:hover { color: var(--red); }
 
 /* ---- Responsive ---- */
-/* Toast notification */
-.toast {
-  position: fixed;
-  bottom: 20px; left: 50%;
-  transform: translateX(-50%) translateY(100px);
-  background: var(--surface);
-  border: 1px solid var(--accent);
-  color: var(--text);
-  padding: 0.6rem 1.2rem;
-  border-radius: 8px;
-  font-size: 0.85rem;
-  z-index: 9999;
-  opacity: 0;
-  transition: all 0.3s ease;
-  pointer-events: none;
-  max-width: 90vw;
-  word-break: break-all;
-}
-.toast.show {
-  opacity: 1;
-  transform: translateX(-50%) translateY(0);
-}
-
 @media (max-width: 900px) {
   .main-content { margin-right: 0; }
   .winamp { display: none; }
@@ -1246,12 +1246,6 @@ input[type="checkbox"] {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({id: folderBtn.dataset.folderId}),
-      }).then(r => r.json()).then(data => {
-        navigator.clipboard.writeText(data.path).then(() => {
-          showToast('Copied to clipboard: ' + data.path);
-        }).catch(() => {
-          showToast('Download folder: ' + data.path);
-        });
       });
       return;
     }
@@ -1374,20 +1368,6 @@ input[type="checkbox"] {
     es.onerror = () => {};
   }
 
-  function showToast(msg) {
-    let el = document.getElementById('toast');
-    if (!el) {
-      el = document.createElement('div');
-      el.id = 'toast';
-      el.className = 'toast';
-      document.body.appendChild(el);
-    }
-    el.textContent = msg;
-    el.classList.add('show');
-    clearTimeout(el._timer);
-    el._timer = setTimeout(() => el.classList.remove('show'), 4000);
-  }
-
   function logMsg(text, cls) {
     const div = document.createElement('div');
     if (cls) div.className = cls;
@@ -1414,7 +1394,7 @@ input[type="checkbox"] {
     // Update play button
     const playCell = row.children[2];
     if (t.status === 'downloaded' && !playCell.querySelector('.play-btn')) {
-      playCell.innerHTML = `<button class="play-btn" data-play-id="${t.id}" title="Play">&#9654;</button>`;
+      playCell.innerHTML = `<button class="play-btn" data-play-id="${t.id}" title="Play">&#9654;</button><button class="folder-btn" data-folder-id="${t.id}" title="Open folder">&#128193;</button>`;
     }
   }
 
@@ -1795,6 +1775,8 @@ def main():
         def process_request_thread(self, request, client_address):
             try:
                 self.finish_request(request, client_address)
+            except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError, OSError):
+                pass
             except Exception:
                 self.handle_error(request, client_address)
             finally:
