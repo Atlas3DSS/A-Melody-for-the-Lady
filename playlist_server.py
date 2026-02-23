@@ -290,9 +290,9 @@ class Handler(BaseHTTPRequestHandler):
                         ["wslpath", "-w", str(output_dir)],
                         capture_output=True, text=True
                     ).stdout.strip()
-                # explorer.exe on WSL needs the whole thing as one shell command
+                # explorer.exe on WSL needs full path and shell command
                 _subprocess.Popen(
-                    f'explorer.exe /select,"{win_path}"',
+                    f'/mnt/c/Windows/explorer.exe /select,"{win_path}"',
                     shell=True
                 )
             elif system == "Windows":
