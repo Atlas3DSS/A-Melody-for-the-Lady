@@ -268,33 +268,21 @@ class Handler(BaseHTTPRequestHandler):
             self._json_response({"error": str(exc)}, 500)
 
     def _api_open_folder(self):
-        """Return the download folder path. Try to open it in OS file manager."""
+        """Return the download folder path and try to open it in OS file manager."""
         output_dir = str(app_state["output_dir"])
         system = platform.system()
-        opened = False
 
+        # Best-effort OS open — don't rely on this working
         try:
             if system == "Windows":
                 import os
                 os.startfile(output_dir)
-                opened = True
             elif system == "Darwin":
                 _subprocess.Popen(["open", output_dir])
-                opened = True
-            else:
-                for cmd in ["xdg-open", "wslview", "nautilus", "dolphin", "thunar", "nemo"]:
-                    try:
-                        _subprocess.Popen([cmd, output_dir],
-                                          stdout=_subprocess.DEVNULL,
-                                          stderr=_subprocess.DEVNULL)
-                        opened = True
-                        break
-                    except FileNotFoundError:
-                        continue
         except Exception:
             pass
 
-        self._json_response({"ok": opened, "path": output_dir})
+        self._json_response({"path": output_dir})
 
     def _api_audio(self, video_id: str):
         """Serve audio file with HTTP Range support for seeking."""
@@ -1259,14 +1247,11 @@ input[type="checkbox"] {
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({id: folderBtn.dataset.folderId}),
       }).then(r => r.json()).then(data => {
-        if (!data.ok) {
-          // Couldn't open natively — copy path to clipboard and notify
-          navigator.clipboard.writeText(data.path).then(() => {
-            showToast('Path copied to clipboard: ' + data.path);
-          }).catch(() => {
-            showToast('Download folder: ' + data.path);
-          });
-        }
+        navigator.clipboard.writeText(data.path).then(() => {
+          showToast('Copied to clipboard: ' + data.path);
+        }).catch(() => {
+          showToast('Download folder: ' + data.path);
+        });
       });
       return;
     }
