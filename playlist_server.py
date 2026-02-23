@@ -268,7 +268,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json_response({"error": str(exc)}, 500)
 
     def _api_open_folder(self):
-        """Open the download folder in the OS file manager. Tries multiple methods."""
+        """Return the download folder path. Try to open it in OS file manager."""
         output_dir = str(app_state["output_dir"])
         system = platform.system()
         opened = False
@@ -282,7 +282,6 @@ class Handler(BaseHTTPRequestHandler):
                 _subprocess.Popen(["open", output_dir])
                 opened = True
             else:
-                # Linux / WSL — try methods in order of reliability
                 for cmd in ["xdg-open", "wslview", "nautilus", "dolphin", "thunar", "nemo"]:
                     try:
                         _subprocess.Popen([cmd, output_dir],
@@ -292,36 +291,10 @@ class Handler(BaseHTTPRequestHandler):
                         break
                     except FileNotFoundError:
                         continue
+        except Exception:
+            pass
 
-                # Last resort for WSL: find explorer.exe and convert path
-                if not opened:
-                    try:
-                        win_path = _subprocess.run(
-                            ["wslpath", "-w", output_dir],
-                            capture_output=True, text=True
-                        ).stdout.strip()
-                        if win_path:
-                            explorer = _subprocess.run(
-                                ["which", "explorer.exe"],
-                                capture_output=True, text=True
-                            ).stdout.strip()
-                            if not explorer:
-                                # Search common locations
-                                for p in ["/mnt/c/Windows/explorer.exe", "/mnt/c/WINDOWS/explorer.exe"]:
-                                    if Path(p).exists():
-                                        explorer = p
-                                        break
-                            if explorer:
-                                _subprocess.Popen([explorer, win_path],
-                                                  stdout=_subprocess.DEVNULL,
-                                                  stderr=_subprocess.DEVNULL)
-                                opened = True
-                    except FileNotFoundError:
-                        pass
-
-            self._json_response({"ok": opened, "path": output_dir})
-        except Exception as exc:
-            self._json_response({"error": str(exc)}, 500)
+        self._json_response({"ok": opened, "path": output_dir})
 
     def _api_audio(self, video_id: str):
         """Serve audio file with HTTP Range support for seeking."""
@@ -988,6 +961,29 @@ input[type="checkbox"] {
 .wa-pl-remove:hover { color: var(--red); }
 
 /* ---- Responsive ---- */
+/* Toast notification */
+.toast {
+  position: fixed;
+  bottom: 20px; left: 50%;
+  transform: translateX(-50%) translateY(100px);
+  background: var(--surface);
+  border: 1px solid var(--accent);
+  color: var(--text);
+  padding: 0.6rem 1.2rem;
+  border-radius: 8px;
+  font-size: 0.85rem;
+  z-index: 9999;
+  opacity: 0;
+  transition: all 0.3s ease;
+  pointer-events: none;
+  max-width: 90vw;
+  word-break: break-all;
+}
+.toast.show {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}
+
 @media (max-width: 900px) {
   .main-content { margin-right: 0; }
   .winamp { display: none; }
@@ -1262,6 +1258,15 @@ input[type="checkbox"] {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({id: folderBtn.dataset.folderId}),
+      }).then(r => r.json()).then(data => {
+        if (!data.ok) {
+          // Couldn't open natively — copy path to clipboard and notify
+          navigator.clipboard.writeText(data.path).then(() => {
+            showToast('Path copied to clipboard: ' + data.path);
+          }).catch(() => {
+            showToast('Download folder: ' + data.path);
+          });
+        }
       });
       return;
     }
@@ -1382,6 +1387,20 @@ input[type="checkbox"] {
       updateDownloadBtn(); updateStats();
     });
     es.onerror = () => {};
+  }
+
+  function showToast(msg) {
+    let el = document.getElementById('toast');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'toast';
+      el.className = 'toast';
+      document.body.appendChild(el);
+    }
+    el.textContent = msg;
+    el.classList.add('show');
+    clearTimeout(el._timer);
+    el._timer = setTimeout(() => el.classList.remove('show'), 4000);
   }
 
   function logMsg(text, cls) {
