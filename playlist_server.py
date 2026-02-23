@@ -21,7 +21,7 @@ import time
 import webbrowser
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import unquote, parse_qs
 
 from playlist_dl import (
     PLAYLIST_URL,
@@ -36,6 +36,13 @@ from playlist_dl import (
     download_track,
 )
 
+try:
+    import numpy as np
+    from recommender import find_similar, load_discovery_embeddings
+    _HAS_RECOMMENDER = True
+except ImportError:
+    _HAS_RECOMMENDER = False
+
 # ---------------------------------------------------------------------------
 # Global state
 # ---------------------------------------------------------------------------
@@ -47,6 +54,10 @@ app_state = {
     "downloading": False,
     "cancel_flag": False,
     "current_id": None,
+    "embeddings": None,
+    "embeddings_mtime": 0,
+    "discovery_embeddings": None,
+    "discovery_mtime": 0,
 }
 
 sse_clients: list[queue.Queue] = []
@@ -64,6 +75,41 @@ def broadcast_sse(event: str, data: dict):
                 dead.append(q)
         for q in dead:
             sse_clients.remove(q)
+
+
+def get_embeddings():
+    """Load embeddings from disk, cached and auto-refreshed on file change."""
+    if not _HAS_RECOMMENDER:
+        return None
+    emb_path = app_state["output_dir"] / "embeddings.npz"
+    if not emb_path.exists():
+        return None
+    mtime = emb_path.stat().st_mtime
+    if app_state["embeddings"] is None or mtime > app_state["embeddings_mtime"]:
+        data = np.load(emb_path, allow_pickle=True)
+        app_state["embeddings"] = {
+            "ids": list(data["ids"]),
+            "titles": list(data["titles"]),
+            "vae": data["vae"],
+            "clap": data["clap"],
+        }
+        app_state["embeddings_mtime"] = mtime
+    return app_state["embeddings"]
+
+
+def get_discovery_embeddings():
+    """Load discovery embeddings from disk, cached and auto-refreshed."""
+    if not _HAS_RECOMMENDER:
+        return None
+    emb_path = app_state["output_dir"] / "discovery_embeddings.npz"
+    if not emb_path.exists():
+        return None
+    mtime = emb_path.stat().st_mtime
+    if app_state["discovery_embeddings"] is None or mtime > app_state["discovery_mtime"]:
+        app_state["discovery_embeddings"] = load_discovery_embeddings(
+            app_state["output_dir"])
+        app_state["discovery_mtime"] = mtime
+    return app_state["discovery_embeddings"]
 
 
 def download_worker(ids: list[str]):
@@ -174,13 +220,22 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
-        path = unquote(self.path)
+        raw = unquote(self.path)
+        path = raw.split("?")[0]
+        qs = raw.split("?", 1)[1] if "?" in raw else ""
         if path == "/":
             self._serve_html()
         elif path == "/api/tracks":
             self._api_tracks()
         elif path == "/api/progress":
             self._api_sse()
+        elif path.startswith("/api/similar/"):
+            vid_id = path[len("/api/similar/"):]
+            self._api_similar(vid_id, qs)
+        elif path == "/api/search-semantic":
+            self._api_semantic_search(qs)
+        elif path == "/api/embeddings-status":
+            self._api_embeddings_status()
         elif path.startswith("/api/audio/") and path.endswith("/thumb"):
             vid_id = path[len("/api/audio/"):-len("/thumb")]
             self._api_thumb(vid_id)
@@ -306,6 +361,68 @@ class Handler(BaseHTTPRequestHandler):
             self._json_response({"ok": True})
         except Exception as exc:
             self._json_response({"error": str(exc)}, 500)
+
+    def _api_similar(self, video_id: str, qs: str):
+        """Return top-N similar tracks by blended embedding similarity."""
+        if not _HAS_RECOMMENDER:
+            self._json_response(
+                {"error": "Recommender not available (numpy/recommender.py missing)"}, 501)
+            return
+        params = parse_qs(qs)
+        n = int(params.get("n", ["20"])[0])
+        alpha = float(params.get("alpha", ["0.5"])[0])
+        emb_data = get_embeddings()
+        if emb_data is None:
+            self._json_response(
+                {"error": "No embeddings found. Run 'python recommender.py embed' first."}, 404)
+            return
+        disc_data = get_discovery_embeddings()
+        results = find_similar(emb_data, video_id, n=n, alpha=alpha,
+                               discovery_data=disc_data)
+        query_title = ""
+        if video_id in emb_data["ids"]:
+            query_title = emb_data["titles"][emb_data["ids"].index(video_id)]
+        elif disc_data and video_id in disc_data["ids"]:
+            query_title = disc_data["titles"][disc_data["ids"].index(video_id)]
+        self._json_response({
+            "query_id": video_id, "query_title": query_title, "results": results,
+        })
+
+    def _api_semantic_search(self, qs: str):
+        """Search tracks by text description using CLAP text encoder."""
+        params = parse_qs(qs)
+        q = params.get("q", [""])[0]
+        n = int(params.get("n", ["20"])[0])
+        if not q:
+            self._json_response({"error": "No query provided"}, 400)
+            return
+        emb_data = get_embeddings()
+        if emb_data is None:
+            self._json_response(
+                {"error": "No embeddings found. Run 'python recommender.py embed' first."}, 404)
+            return
+        try:
+            from recommender import search_by_text, load_clap
+            if app_state.get("clap_model") is None:
+                app_state["clap_model"], app_state["clap_processor"] = load_clap(
+                    device="cuda")
+            results = search_by_text(
+                emb_data, app_state["clap_model"], app_state["clap_processor"],
+                q, n=n, device="cuda")
+            self._json_response({"query": q, "results": results})
+        except ImportError:
+            self._json_response(
+                {"error": "Semantic search requires torch and transformers. Activate the dev venv."}, 501)
+        except Exception as e:
+            self._json_response({"error": str(e)}, 500)
+
+    def _api_embeddings_status(self):
+        """Return status of the embeddings file."""
+        emb_data = get_embeddings() if _HAS_RECOMMENDER else None
+        if emb_data:
+            self._json_response({"available": True, "count": len(emb_data["ids"])})
+        else:
+            self._json_response({"available": False, "count": 0})
 
     def _api_audio(self, video_id: str):
         """Serve audio file with HTTP Range support for seeking."""
@@ -619,7 +736,7 @@ input[type="checkbox"] {
 .col-num { width: 55px; color: var(--text2); text-align: center; }
 .col-status { width: 110px; }
 .col-id { width: 120px; font-family: monospace; font-size: 0.8rem; color: var(--text2); }
-.col-play { width: 58px; text-align: center; white-space: nowrap; }
+.col-play { width: 84px; text-align: center; white-space: nowrap; }
 
 .play-btn, .folder-btn {
   background: none; border: none; cursor: pointer;
@@ -629,7 +746,7 @@ input[type="checkbox"] {
 .play-btn { color: var(--green); }
 .folder-btn { color: var(--text2); font-size: 0.95rem; margin-left: 4px; }
 .play-btn:hover, .folder-btn:hover { opacity: 1; }
-.col-play { width: 58px; text-align: center; white-space: nowrap; }
+.col-play { width: 84px; text-align: center; white-space: nowrap; }
 
 .scroll-body { max-height: 70vh; overflow-y: auto; }
 
@@ -971,6 +1088,90 @@ input[type="checkbox"] {
 }
 .wa-pl-remove:hover { color: var(--red); }
 
+/* ===== SIMILAR BUTTON ===== */
+.similar-btn {
+  background: none; border: none; cursor: pointer;
+  font-size: 0.85rem; padding: 0; margin-left: 4px;
+  opacity: 0.5; transition: opacity 0.15s;
+  color: var(--accent2);
+}
+.similar-btn:hover { opacity: 1; }
+
+/* ===== MODAL ===== */
+.modal-overlay {
+  position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+  background: rgba(0,0,0,0.75); z-index: 200;
+  display: none; align-items: center; justify-content: center;
+}
+.modal-overlay.active { display: flex; }
+.modal {
+  background: var(--bg2); border: 1px solid var(--border);
+  border-radius: 12px; width: 620px; max-width: 92vw;
+  max-height: 80vh; display: flex; flex-direction: column;
+  overflow: hidden; box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+}
+.modal-header {
+  padding: 1rem 1.25rem; border-bottom: 1px solid var(--border);
+  display: flex; justify-content: space-between; align-items: center;
+  background: var(--bg3);
+}
+.modal-header h2 {
+  font-size: 0.95rem; font-weight: 600;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  flex: 1; margin-right: 1rem;
+}
+.modal-close {
+  cursor: pointer; background: none; border: none;
+  color: var(--text2); font-size: 1.3rem; padding: 0 4px;
+  transition: color 0.15s;
+}
+.modal-close:hover { color: var(--text); }
+.modal-body { flex: 1; overflow-y: auto; padding: 0; }
+.modal-loading {
+  display: flex; align-items: center; justify-content: center;
+  padding: 3rem; color: var(--text2); gap: 0.5rem;
+}
+.modal-error { padding: 2rem; text-align: center; color: var(--red); }
+
+.sim-result {
+  display: flex; align-items: center; gap: 0.5rem;
+  padding: 0.55rem 1rem; border-bottom: 1px solid var(--border);
+  transition: background 0.1s; cursor: default;
+}
+.sim-result:hover { background: #ffffff08; }
+.sim-result:last-child { border-bottom: none; }
+.sim-rank { color: var(--text2); font-size: 0.8rem; width: 26px; text-align: right; flex-shrink: 0; }
+.sim-score-bar {
+  width: 50px; height: 6px; background: var(--bg);
+  border-radius: 3px; overflow: hidden; flex-shrink: 0;
+}
+.sim-score-fill {
+  height: 100%; border-radius: 3px;
+  background: linear-gradient(90deg, var(--accent), var(--green));
+}
+.sim-score {
+  font-family: monospace; font-size: 0.75rem; color: var(--accent2);
+  width: 40px; text-align: center; flex-shrink: 0;
+}
+.sim-title {
+  flex: 1; font-size: 0.85rem;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.sim-actions { display: flex; gap: 4px; flex-shrink: 0; }
+.sim-actions button {
+  background: none; border: 1px solid var(--border); border-radius: 4px;
+  color: var(--text2); cursor: pointer; font-size: 0.75rem;
+  padding: 2px 6px; transition: all 0.15s;
+}
+.sim-actions button:hover { border-color: var(--accent); color: var(--text); background: var(--surface); }
+
+/* ===== SEMANTIC SEARCH ===== */
+.semantic-row {
+  display: flex; gap: 0.5rem; align-items: center;
+  margin-bottom: 1rem;
+}
+.semantic-row input[type="text"] { flex: 1; }
+
 /* ---- Responsive ---- */
 @media (max-width: 900px) {
   .main-content { margin-right: 0; }
@@ -1015,6 +1216,11 @@ input[type="checkbox"] {
     <button class="btn primary" id="btn-download">Download Selected</button>
     <button class="btn danger" id="btn-cancel" style="display:none">Cancel</button>
     <button class="btn sm" id="btn-refresh" title="Re-fetch playlist from YouTube">Refresh</button>
+  </div>
+
+  <div class="semantic-row" id="semantic-row" style="display:none">
+    <input type="text" id="semantic-input" placeholder="Describe a vibe... (e.g. &quot;dark techno heavy bass&quot;, &quot;melodic ambient&quot;)">
+    <button class="btn sm" id="btn-semantic">Semantic Search</button>
   </div>
 
   <div class="progress-panel" id="progress-panel">
@@ -1118,6 +1324,17 @@ input[type="checkbox"] {
 
 </div><!-- /page-layout -->
 
+<!-- Similar tracks modal -->
+<div class="modal-overlay" id="modal-overlay">
+  <div class="modal">
+    <div class="modal-header">
+      <h2 id="modal-title">Similar Tracks</h2>
+      <button class="modal-close" id="modal-close">&times;</button>
+    </div>
+    <div class="modal-body" id="modal-body"></div>
+  </div>
+</div>
+
 <script>
 (function(){
   const $ = id => document.getElementById(id);
@@ -1188,7 +1405,7 @@ input[type="checkbox"] {
                       : t.status === 'failed' ? 'Failed' : 'Pending';
       const titleEsc = escHtml(t.title);
       const playCell = t.status === 'downloaded'
-        ? `<td class="col-play"><button class="play-btn" data-play-id="${t.id}" title="Play">&#9654;</button><button class="folder-btn" data-folder-id="${t.id}" title="Open folder">&#128193;</button></td>`
+        ? `<td class="col-play"><button class="play-btn" data-play-id="${t.id}" title="Play">&#9654;</button><button class="folder-btn" data-folder-id="${t.id}" title="Open folder">&#128193;</button><button class="similar-btn" data-similar-id="${t.id}" title="Find similar">&#8776;</button></td>`
         : `<td class="col-play"></td>`;
       fragments.push(
         `<tr class="${rowClass}" data-id="${t.id}">` +
@@ -1247,6 +1464,13 @@ input[type="checkbox"] {
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({id: folderBtn.dataset.folderId}),
       });
+      return;
+    }
+
+    const simBtn = e.target.closest('.similar-btn');
+    if (simBtn) {
+      e.stopPropagation();
+      fetchSimilar(simBtn.dataset.similarId);
       return;
     }
 
@@ -1394,7 +1618,7 @@ input[type="checkbox"] {
     // Update play button
     const playCell = row.children[2];
     if (t.status === 'downloaded' && !playCell.querySelector('.play-btn')) {
-      playCell.innerHTML = `<button class="play-btn" data-play-id="${t.id}" title="Play">&#9654;</button><button class="folder-btn" data-folder-id="${t.id}" title="Open folder">&#128193;</button>`;
+      playCell.innerHTML = `<button class="play-btn" data-play-id="${t.id}" title="Play">&#9654;</button><button class="folder-btn" data-folder-id="${t.id}" title="Open folder">&#128193;</button><button class="similar-btn" data-similar-id="${t.id}" title="Find similar">&#8776;</button>`;
     }
   }
 
@@ -1724,10 +1948,134 @@ input[type="checkbox"] {
     return String(m).padStart(2, '0') + ':' + String(sec).padStart(2, '0');
   }
 
+  /* ==================================================================
+     RECOMMENDATION ENGINE
+     ================================================================== */
+  let embeddingsAvailable = false;
+
+  async function checkEmbeddings() {
+    try {
+      const r = await fetch('/api/embeddings-status');
+      const data = await r.json();
+      embeddingsAvailable = data.available;
+      if (embeddingsAvailable) {
+        $('semantic-row').style.display = '';
+      }
+    } catch(e) {}
+  }
+
+  async function fetchSimilar(videoId) {
+    showModal('Finding similar tracks...', true);
+    try {
+      const r = await fetch(`/api/similar/${videoId}?n=20`);
+      const data = await r.json();
+      if (data.error) { showModalError(data.error); return; }
+      showModalResults(`Similar to: ${data.query_title}`, data.results);
+    } catch(e) { showModalError('Failed to fetch: ' + e.message); }
+  }
+
+  async function doSemanticSearch(query) {
+    if (!query.trim()) return;
+    showModal('Searching...', true);
+    try {
+      const r = await fetch(`/api/search-semantic?q=${encodeURIComponent(query)}&n=20`);
+      const data = await r.json();
+      if (data.error) { showModalError(data.error); return; }
+      showModalResults(`Search: "${data.query}"`, data.results);
+    } catch(e) { showModalError('Failed to fetch: ' + e.message); }
+  }
+
+  function showModal(title, isLoading) {
+    $('modal-title').textContent = title;
+    $('modal-body').innerHTML = isLoading
+      ? '<div class="modal-loading"><div class="spinner"></div> Loading...</div>'
+      : '';
+    $('modal-overlay').classList.add('active');
+  }
+
+  function showModalError(msg) {
+    $('modal-body').innerHTML = `<div class="modal-error">${escHtml(msg)}</div>`;
+  }
+
+  function showModalResults(title, results) {
+    $('modal-title').textContent = title;
+    if (!results.length) {
+      $('modal-body').innerHTML = '<div class="modal-error">No results found.</div>';
+      return;
+    }
+    const frags = [];
+    for (let i = 0; i < results.length; i++) {
+      const r = results[i];
+      const pct = Math.round(r.score * 100);
+      const isLibrary = r.source !== 'discovery';
+      const isDownloaded = allTracks.some(t => t.id === r.id && t.status === 'downloaded');
+      let actionBtns = '';
+      if (isDownloaded) {
+        actionBtns += `<button data-mplay="${r.id}" title="Play">&#9654;</button>`;
+        actionBtns += `<button data-mqueue="${r.id}" title="Queue">+</button>`;
+      } else if (!isLibrary) {
+        actionBtns += `<button data-myt="${r.id}" title="Listen on YouTube">&#127911;</button>`;
+      }
+      actionBtns += `<button data-msim="${r.id}" title="Find similar">&#8776;</button>`;
+      const tag = isLibrary ? '' : '<span style="color:var(--yellow);font-size:0.7rem;margin-left:4px">NEW</span>';
+      frags.push(
+        `<div class="sim-result">` +
+        `<span class="sim-rank">${i + 1}.</span>` +
+        `<div class="sim-score-bar"><div class="sim-score-fill" style="width:${pct}%"></div></div>` +
+        `<span class="sim-score">${pct}%</span>` +
+        `<span class="sim-title" title="${escHtml(r.title)}">${escHtml(r.title)}${tag}</span>` +
+        `<span class="sim-actions">${actionBtns}</span>` +
+        `</div>`
+      );
+    }
+    $('modal-body').innerHTML = frags.join('');
+  }
+
+  // Modal close
+  $('modal-close').addEventListener('click', () => $('modal-overlay').classList.remove('active'));
+  $('modal-overlay').addEventListener('click', e => {
+    if (e.target === $('modal-overlay')) $('modal-overlay').classList.remove('active');
+  });
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') $('modal-overlay').classList.remove('active');
+  });
+
+  // Modal button handlers
+  $('modal-body').addEventListener('click', e => {
+    const playBtn = e.target.closest('[data-mplay]');
+    if (playBtn) {
+      const t = allTracks.find(t => t.id === playBtn.dataset.mplay);
+      if (t) player.playNow(t);
+      return;
+    }
+    const queueBtn = e.target.closest('[data-mqueue]');
+    if (queueBtn) {
+      const t = allTracks.find(t => t.id === queueBtn.dataset.mqueue);
+      if (t) { player.addToQueue(t); queueBtn.textContent = '\u2713'; }
+      return;
+    }
+    const ytBtn = e.target.closest('[data-myt]');
+    if (ytBtn) {
+      window.open(`https://www.youtube.com/watch?v=${ytBtn.dataset.myt}`, '_blank');
+      return;
+    }
+    const simBtn = e.target.closest('[data-msim]');
+    if (simBtn) { fetchSimilar(simBtn.dataset.msim); return; }
+  });
+
+  // Semantic search handlers
+  $('btn-semantic').addEventListener('click', () => {
+    doSemanticSearch($('semantic-input').value);
+  });
+  $('semantic-input').addEventListener('keydown', e => {
+    if (e.key === 'Enter') doSemanticSearch($('semantic-input').value);
+  });
+
   // ---- Init ----
   player.init();
   fetchTracks();
   connectSSE();
+  checkEmbeddings();
 })();
 </script>
 </body>
