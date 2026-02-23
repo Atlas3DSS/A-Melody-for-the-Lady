@@ -273,45 +273,47 @@ class Handler(BaseHTTPRequestHandler):
         file_size = fpath.stat().st_size
         content_type = mimetypes.guess_type(str(fpath))[0] or "audio/ogg"
 
-        range_header = self.headers.get("Range")
-        if range_header:
-            # Parse "bytes=start-end"
-            range_spec = range_header.replace("bytes=", "")
-            parts = range_spec.split("-")
-            start = int(parts[0]) if parts[0] else 0
-            end = int(parts[1]) if parts[1] else file_size - 1
-            end = min(end, file_size - 1)
-            length = end - start + 1
+        try:
+            range_header = self.headers.get("Range")
+            if range_header:
+                range_spec = range_header.replace("bytes=", "")
+                parts = range_spec.split("-")
+                start = int(parts[0]) if parts[0] else 0
+                end = int(parts[1]) if parts[1] else file_size - 1
+                end = min(end, file_size - 1)
+                length = end - start + 1
 
-            self.send_response(206)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(length))
-            self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
-            self.send_header("Accept-Ranges", "bytes")
-            self.end_headers()
+                self.send_response(206)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(length))
+                self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
+                self.send_header("Accept-Ranges", "bytes")
+                self.end_headers()
 
-            with open(fpath, "rb") as f:
-                f.seek(start)
-                remaining = length
-                while remaining > 0:
-                    chunk = f.read(min(65536, remaining))
-                    if not chunk:
-                        break
-                    self.wfile.write(chunk)
-                    remaining -= len(chunk)
-        else:
-            self.send_response(200)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(file_size))
-            self.send_header("Accept-Ranges", "bytes")
-            self.end_headers()
+                with open(fpath, "rb") as f:
+                    f.seek(start)
+                    remaining = length
+                    while remaining > 0:
+                        chunk = f.read(min(65536, remaining))
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        remaining -= len(chunk)
+            else:
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(file_size))
+                self.send_header("Accept-Ranges", "bytes")
+                self.end_headers()
 
-            with open(fpath, "rb") as f:
-                while True:
-                    chunk = f.read(65536)
-                    if not chunk:
-                        break
-                    self.wfile.write(chunk)
+                with open(fpath, "rb") as f:
+                    while True:
+                        chunk = f.read(65536)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
 
     def _api_thumb(self, video_id: str):
         """Serve thumbnail image."""
