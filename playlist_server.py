@@ -12,8 +12,10 @@ Usage:
 import argparse
 import json
 import mimetypes
+import platform
 import queue
 import random
+import subprocess as _subprocess
 import threading
 import time
 import webbrowser
@@ -195,6 +197,8 @@ class Handler(BaseHTTPRequestHandler):
             self._api_cancel()
         elif self.path == "/api/refresh":
             self._api_refresh()
+        elif self.path.startswith("/api/open-folder"):
+            self._api_open_folder()
         else:
             self.send_error(404)
 
@@ -260,6 +264,41 @@ class Handler(BaseHTTPRequestHandler):
             app_state["entries"] = entries
             app_state["completed"] = load_progress(app_state["output_dir"])
             self._json_response({"ok": True, "count": len(entries)})
+        except Exception as exc:
+            self._json_response({"error": str(exc)}, 500)
+
+    def _api_open_folder(self):
+        """Open the download folder in the OS file manager, highlighting a file if given."""
+        body = self._read_json_body()
+        video_id = body.get("id")
+
+        target_file = find_audio_file(video_id) if video_id else None
+        output_dir = app_state["output_dir"]
+
+        try:
+            # WSL — use explorer.exe
+            if "microsoft" in platform.uname().release.lower():
+                if target_file:
+                    win_path = _subprocess.run(
+                        ["wslpath", "-w", str(target_file)],
+                        capture_output=True, text=True
+                    ).stdout.strip()
+                    _subprocess.Popen(["explorer.exe", "/select,", win_path])
+                else:
+                    win_path = _subprocess.run(
+                        ["wslpath", "-w", str(output_dir)],
+                        capture_output=True, text=True
+                    ).stdout.strip()
+                    _subprocess.Popen(["explorer.exe", win_path])
+            elif platform.system() == "Darwin":
+                if target_file:
+                    _subprocess.Popen(["open", "-R", str(target_file)])
+                else:
+                    _subprocess.Popen(["open", str(output_dir)])
+            else:
+                _subprocess.Popen(["xdg-open", str(output_dir)])
+
+            self._json_response({"ok": True})
         except Exception as exc:
             self._json_response({"error": str(exc)}, 500)
 
@@ -575,14 +614,17 @@ input[type="checkbox"] {
 .col-num { width: 55px; color: var(--text2); text-align: center; }
 .col-status { width: 110px; }
 .col-id { width: 120px; font-family: monospace; font-size: 0.8rem; color: var(--text2); }
-.col-play { width: 40px; text-align: center; }
+.col-play { width: 58px; text-align: center; white-space: nowrap; }
 
-.play-btn {
+.play-btn, .folder-btn {
   background: none; border: none; cursor: pointer;
-  color: var(--green); font-size: 1.1rem; padding: 0;
+  font-size: 1.1rem; padding: 0;
   opacity: 0.7; transition: opacity 0.15s;
 }
-.play-btn:hover { opacity: 1; }
+.play-btn { color: var(--green); }
+.folder-btn { color: var(--text2); font-size: 0.95rem; margin-left: 4px; }
+.play-btn:hover, .folder-btn:hover { opacity: 1; }
+.col-play { width: 58px; text-align: center; white-space: nowrap; }
 
 .scroll-body { max-height: 70vh; overflow-y: auto; }
 
@@ -1141,7 +1183,7 @@ input[type="checkbox"] {
                       : t.status === 'failed' ? 'Failed' : 'Pending';
       const titleEsc = escHtml(t.title);
       const playCell = t.status === 'downloaded'
-        ? `<td class="col-play"><button class="play-btn" data-play-id="${t.id}" title="Play">&#9654;</button></td>`
+        ? `<td class="col-play"><button class="play-btn" data-play-id="${t.id}" title="Play">&#9654;</button><button class="folder-btn" data-folder-id="${t.id}" title="Open folder">&#128193;</button></td>`
         : `<td class="col-play"></td>`;
       fragments.push(
         `<tr class="${rowClass}" data-id="${t.id}">` +
@@ -1181,7 +1223,7 @@ input[type="checkbox"] {
     }
   });
 
-  // Play button click
+  // Play button + folder button clicks
   tbody.addEventListener('click', e => {
     const playBtn = e.target.closest('.play-btn');
     if (playBtn) {
@@ -1189,6 +1231,17 @@ input[type="checkbox"] {
       const id = playBtn.dataset.playId;
       const t = allTracks.find(t => t.id === id);
       if (t) player.playNow(t);
+      return;
+    }
+
+    const folderBtn = e.target.closest('.folder-btn');
+    if (folderBtn) {
+      e.stopPropagation();
+      fetch('/api/open-folder', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({id: folderBtn.dataset.folderId}),
+      });
       return;
     }
 
