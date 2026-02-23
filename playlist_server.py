@@ -146,24 +146,22 @@ def download_worker(ids: list[str]):
     })
 
 
-def find_audio_file(video_id: str) -> Path | None:
-    """Find the downloaded .opus file for a video ID."""
+def find_file_by_id(video_id: str, extensions: tuple[str, ...]) -> Path | None:
+    """Find a file containing [video_id] in its name with one of the given extensions."""
     output_dir = app_state["output_dir"]
-    for ext in ("opus", "m4a", "mp3", "ogg", "webm"):
-        matches = list(output_dir.glob(f"*[{video_id}].{ext}"))
-        if matches:
-            return matches[0]
+    tag = f"[{video_id}]"
+    for f in output_dir.iterdir():
+        if tag in f.name and f.suffix.lstrip(".") in extensions:
+            return f
     return None
+
+
+def find_audio_file(video_id: str) -> Path | None:
+    return find_file_by_id(video_id, ("opus", "m4a", "mp3", "ogg", "webm"))
 
 
 def find_thumb_file(video_id: str) -> Path | None:
-    """Find the thumbnail file for a video ID."""
-    output_dir = app_state["output_dir"]
-    for ext in ("jpg", "png", "webp"):
-        matches = list(output_dir.glob(f"*[{video_id}].{ext}"))
-        if matches:
-            return matches[0]
-    return None
+    return find_file_by_id(video_id, ("jpg", "png", "webp"))
 
 
 # ---------------------------------------------------------------------------

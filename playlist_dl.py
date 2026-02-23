@@ -131,10 +131,10 @@ def download_track(video_id: str, output_dir: Path) -> bool:
         return True
 
     # Check if an audio file was actually written despite the error
-    pattern = f"*[{video_id}].opus"
-    matches = list(output_dir.glob(pattern))
-    if matches:
-        return True
+    tag = f"[{video_id}]"
+    for f in output_dir.iterdir():
+        if tag in f.name and f.suffix in (".opus", ".m4a", ".mp3", ".ogg", ".webm"):
+            return True
 
     err = result.stderr.strip()
     if err:
