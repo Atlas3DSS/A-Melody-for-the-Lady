@@ -305,6 +305,13 @@ class Handler(BaseHTTPRequestHandler):
             self._api_audio(vid_id)
         elif path == "/api/config":
             self._api_config()
+        elif path == "/api/tags":
+            self._api_tags()
+        elif path.startswith("/api/playlist/"):
+            seed_id = path[len("/api/playlist/"):]
+            self._api_playlist(seed_id, qs)
+        elif path == "/api/duplicates":
+            self._api_duplicates(qs)
         else:
             self.send_error(404)
 
@@ -539,6 +546,81 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._json_response({"available": False, "count": 0})
 
+    def _api_tags(self):
+        """Return all track tags from track_tags.json."""
+        tags_file = OUTPUT_DIR / "track_tags.json"
+        if tags_file.exists():
+            try:
+                tags = json.loads(tags_file.read_text())
+                self._json_response({"available": True, "tags": tags})
+            except Exception:
+                self._json_response({"available": False, "tags": {}})
+        else:
+            self._json_response({"available": False, "tags": {}})
+
+    def _api_playlist(self, seed_id: str, qs: str):
+        """Generate smart playlist from seed track."""
+        if not _HAS_RECOMMENDER:
+            self._json_response({"error": "Recommender not available"}, 400)
+            return
+
+        # Parse query params
+        params = {}
+        for part in qs.split("&"):
+            if "=" in part:
+                k, v = part.split("=", 1)
+                params[k] = v
+
+        length = int(params.get("length", 60))
+        drift = float(params.get("drift", 0.3))
+
+        emb_data = get_embeddings()
+        if not emb_data:
+            self._json_response({"error": "Embeddings not loaded"}, 400)
+            return
+
+        from recommender import generate_playlist
+        playlist = generate_playlist(emb_data, seed_id, length_minutes=length, drift=drift)
+
+        if not playlist:
+            self._json_response({"error": "Seed track not found"}, 404)
+            return
+
+        self._json_response({"playlist": playlist})
+
+    def _api_duplicates(self, qs: str):
+        """Find duplicate tracks."""
+        if not _HAS_RECOMMENDER:
+            self._json_response({"error": "Recommender not available"}, 400)
+            return
+
+        params = {}
+        for part in qs.split("&"):
+            if "=" in part:
+                k, v = part.split("=", 1)
+                params[k] = v
+
+        threshold = float(params.get("threshold", 0.98))
+        limit = int(params.get("limit", 50))
+
+        emb_data = get_embeddings()
+        if not emb_data:
+            self._json_response({"error": "Embeddings not loaded"}, 400)
+            return
+
+        from recommender import find_duplicates
+        duplicates = find_duplicates(emb_data, threshold=threshold)
+
+        results = []
+        for d in duplicates[:limit]:
+            results.append({
+                "id1": d[0], "id2": d[1],
+                "similarity": round(d[2], 4),
+                "title1": d[3], "title2": d[4]
+            })
+
+        self._json_response({"duplicates": results, "total": len(duplicates)})
+
     def _api_audio(self, video_id: str):
         """Serve audio file with HTTP Range support for seeking."""
         fpath = find_audio_file(video_id)
@@ -653,37 +735,48 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Playlist Downloader</title>
 <style>
-/* ===== RESET & VARS ===== */
+/* ===== RESET & VARS - NEON BANANA THEME ===== */
 :root {
-  --bg: #0f0f0f;
-  --bg2: #1a1a2e;
-  --bg3: #16213e;
-  --surface: #1e1e3a;
+  --bg: #0a0a12;
+  --bg2: #12121f;
+  --bg3: #1a1a2e;
+  --surface: #15152a;
   --border: #2a2a4a;
-  --text: #e0e0e0;
-  --text2: #8888aa;
-  --accent: #7c3aed;
-  --accent2: #a78bfa;
-  --green: #22c55e;
-  --green-dim: #16a34a33;
-  --red: #ef4444;
-  --red-dim: #ef444433;
-  --yellow: #eab308;
-  --yellow-dim: #eab30833;
-  --blue: #3b82f6;
-  --blue-dim: #3b82f633;
-  /* winamp colors */
-  --wa-bg: #232323;
-  --wa-bg2: #2a2a2a;
-  --wa-border: #0a0a0a;
-  --wa-border-light: #3a3a3a;
-  --wa-lcd: #000000;
-  --wa-green: #00ff00;
-  --wa-green2: #00cc00;
-  --wa-green-dim: #003300;
-  --wa-text: #cccccc;
-  --wa-highlight: #0078d7;
-  --wa-width: 275px;
+  --text: #f0f0f0;
+  --text2: #9090b0;
+  --accent: #f0e130;
+  --accent2: #ffe066;
+  --accent-glow: rgba(240, 225, 48, 0.4);
+  --neon-pink: #ff00ff;
+  --neon-cyan: #00ffff;
+  --neon-green: #39ff14;
+  --green: #39ff14;
+  --green-dim: rgba(57, 255, 20, 0.15);
+  --red: #ff3366;
+  --red-dim: rgba(255, 51, 102, 0.15);
+  --yellow: #f0e130;
+  --yellow-dim: rgba(240, 225, 48, 0.15);
+  --blue: #00d4ff;
+  --blue-dim: rgba(0, 212, 255, 0.15);
+  /* winamp neon colors */
+  --wa-bg: #0d0d15;
+  --wa-bg2: #151522;
+  --wa-border: #000000;
+  --wa-border-light: #2a2a4a;
+  --wa-lcd: #050508;
+  --wa-green: #39ff14;
+  --wa-green2: #00ff88;
+  --wa-green-dim: #0a2010;
+  --wa-yellow: #f0e130;
+  --wa-pink: #ff00ff;
+  --wa-cyan: #00ffff;
+  --wa-text: #e0e0e0;
+  --wa-highlight: #f0e130;
+  --wa-width: 320px;
+  --glow-yellow: 0 0 20px rgba(240, 225, 48, 0.6), 0 0 40px rgba(240, 225, 48, 0.3);
+  --glow-green: 0 0 15px rgba(57, 255, 20, 0.5), 0 0 30px rgba(57, 255, 20, 0.2);
+  --glow-pink: 0 0 15px rgba(255, 0, 255, 0.5), 0 0 30px rgba(255, 0, 255, 0.2);
+  --glow-cyan: 0 0 15px rgba(0, 255, 255, 0.5), 0 0 30px rgba(0, 255, 255, 0.2);
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body {
@@ -718,9 +811,30 @@ header {
   border-radius: 12px;
   padding: 1.5rem;
   margin-bottom: 1rem;
+  position: relative;
+  overflow: hidden;
 }
-header h1 { font-size: 1.5rem; font-weight: 700; margin-bottom: 0.5rem; }
-header h1 span { color: var(--accent2); }
+header::before {
+  content: '';
+  position: absolute;
+  top: -50%;
+  left: -50%;
+  width: 200%;
+  height: 200%;
+  background: radial-gradient(circle, var(--accent-glow) 0%, transparent 50%);
+  opacity: 0.1;
+  pointer-events: none;
+}
+header h1 {
+  font-size: 1.6rem;
+  font-weight: 700;
+  margin-bottom: 0.5rem;
+  text-shadow: var(--glow-yellow);
+}
+header h1 span {
+  color: var(--accent);
+  text-shadow: var(--glow-yellow);
+}
 
 .stats {
   display: flex; gap: 1.5rem; flex-wrap: wrap;
@@ -752,18 +866,47 @@ input[type="text"]::placeholder { color: var(--text2); }
 
 .btn {
   display: inline-flex; align-items: center; gap: 0.35rem;
-  padding: 0.5rem 1rem; border-radius: 8px; border: 1px solid var(--border);
+  padding: 0.5rem 1rem; border-radius: 8px;
+  border: 1px solid var(--border);
   background: var(--surface); color: var(--text);
   font-size: 0.85rem; cursor: pointer; white-space: nowrap;
-  transition: all 0.15s;
+  transition: all 0.2s ease;
+  position: relative;
+  overflow: hidden;
 }
-.btn:hover { border-color: var(--accent); background: var(--bg3); }
+.btn::before {
+  content: '';
+  position: absolute;
+  top: 0; left: -100%;
+  width: 100%; height: 100%;
+  background: linear-gradient(90deg, transparent, rgba(255,255,255,0.1), transparent);
+  transition: left 0.5s;
+}
+.btn:hover::before { left: 100%; }
+.btn:hover {
+  border-color: var(--accent);
+  background: var(--bg3);
+  box-shadow: 0 0 15px var(--accent-glow);
+}
 .btn:active { transform: scale(0.97); }
-.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
-.btn.primary:hover { background: #6d28d9; }
-.btn.primary:disabled { opacity: 0.4; cursor: not-allowed; }
+.btn.primary {
+  background: linear-gradient(135deg, var(--accent), #d4c520);
+  border-color: var(--accent);
+  color: #000;
+  font-weight: 700;
+  text-shadow: none;
+}
+.btn.primary:hover {
+  box-shadow: var(--glow-yellow);
+  background: linear-gradient(135deg, #ffe066, var(--accent));
+}
+.btn.primary:disabled { opacity: 0.4; cursor: not-allowed; box-shadow: none; }
 .btn.danger { border-color: var(--red); color: var(--red); }
-.btn.danger:hover { background: var(--red-dim); }
+.btn.danger:hover { background: var(--red-dim); box-shadow: var(--glow-pink); }
+.btn.neon-green { border-color: var(--neon-green); color: var(--neon-green); }
+.btn.neon-green:hover { box-shadow: var(--glow-green); background: var(--green-dim); }
+.btn.neon-cyan { border-color: var(--neon-cyan); color: var(--neon-cyan); }
+.btn.neon-cyan:hover { box-shadow: var(--glow-cyan); background: var(--blue-dim); }
 .btn.sm { padding: 0.3rem 0.6rem; font-size: 0.8rem; }
 .btn-group { display: flex; gap: 0.35rem; }
 
@@ -919,22 +1062,31 @@ input[type="checkbox"] {
 .wa-toggle.shifted { right: 0; }
 .wa-toggle:hover { background: var(--wa-bg2); }
 
-/* ---- Title bar ---- */
+/* ---- Title bar - Neon ---- */
 .wa-titlebar {
-  background: linear-gradient(180deg, #3a3a5c, #1e1e3a 40%, #2a2a4a);
-  padding: 3px 4px;
+  background: linear-gradient(180deg, #2a2a4a 0%, #15152a 40%, #1a1a35 100%);
+  padding: 4px 6px;
   display: flex; align-items: center; justify-content: space-between;
-  border-bottom: 1px solid var(--wa-border);
-  min-height: 24px;
+  border-bottom: 1px solid #000;
+  min-height: 28px;
   cursor: default;
+  position: relative;
+}
+.wa-titlebar::after {
+  content: '';
+  position: absolute;
+  bottom: 0; left: 0; right: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--wa-yellow), transparent);
+  opacity: 0.3;
 }
 .wa-title-text {
-  font-size: 9px;
+  font-size: 10px;
   font-weight: 700;
-  letter-spacing: 2px;
+  letter-spacing: 3px;
   text-transform: uppercase;
-  color: #fff;
-  text-shadow: 0 0 4px rgba(120,90,255,0.5);
+  color: var(--wa-yellow);
+  text-shadow: 0 0 10px rgba(240, 225, 48, 0.6);
 }
 .wa-title-buttons { display: flex; gap: 2px; }
 .wa-title-btn {
@@ -946,40 +1098,60 @@ input[type="checkbox"] {
 }
 .wa-title-btn:hover { background: #555; }
 
-/* ---- Visualizer ---- */
+/* ---- Visualizer - Neon EQ ---- */
 .wa-visualizer {
-  background: #000;
-  height: 50px;
+  background: linear-gradient(180deg, #000 0%, #0a0a15 100%);
+  height: 100px;
   border-bottom: 1px solid var(--wa-border);
   position: relative;
   overflow: hidden;
+}
+.wa-visualizer::before {
+  content: '';
+  position: absolute;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background:
+    repeating-linear-gradient(0deg, transparent, transparent 3px, rgba(0,0,0,0.3) 3px, rgba(0,0,0,0.3) 4px),
+    repeating-linear-gradient(90deg, transparent, transparent 3px, rgba(0,0,0,0.2) 3px, rgba(0,0,0,0.2) 4px);
+  pointer-events: none;
+  z-index: 1;
 }
 .wa-visualizer canvas {
   width: 100%;
   height: 100%;
   display: block;
+  position: relative;
+  z-index: 0;
 }
 
-/* ---- LCD display ---- */
+/* ---- LCD display - Neon ---- */
 .wa-lcd {
-  background: #000;
-  padding: 6px 8px;
+  background: linear-gradient(180deg, #050510 0%, #0a0a18 100%);
+  padding: 8px 10px;
   border-bottom: 1px solid var(--wa-border);
+  position: relative;
+}
+.wa-lcd::before {
+  content: '';
+  position: absolute;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: radial-gradient(ellipse at center top, rgba(240, 225, 48, 0.05) 0%, transparent 60%);
+  pointer-events: none;
 }
 .wa-lcd-title {
-  height: 16px;
+  height: 18px;
   overflow: hidden;
   position: relative;
 }
 .wa-lcd-marquee {
-  font-family: 'Courier New', monospace;
-  font-size: 11px;
+  font-family: 'Courier New', 'Consolas', monospace;
+  font-size: 12px;
   font-weight: 700;
-  color: var(--wa-green);
+  color: var(--wa-yellow);
   white-space: nowrap;
   position: absolute;
   animation: wa-scroll 12s linear infinite;
-  text-shadow: 0 0 6px rgba(0,255,0,0.4);
+  text-shadow: 0 0 10px rgba(240, 225, 48, 0.6), 0 0 20px rgba(240, 225, 48, 0.3);
 }
 @keyframes wa-scroll {
   0% { transform: translateX(100%); }
@@ -989,25 +1161,27 @@ input[type="checkbox"] {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  margin-top: 4px;
+  margin-top: 6px;
 }
 .wa-lcd-time {
-  font-family: 'Courier New', monospace;
-  font-size: 18px;
+  font-family: 'Courier New', 'Consolas', monospace;
+  font-size: 22px;
   font-weight: 700;
-  color: var(--wa-green);
-  letter-spacing: 1px;
-  text-shadow: 0 0 8px rgba(0,255,0,0.3);
+  color: var(--wa-yellow);
+  letter-spacing: 2px;
+  text-shadow: 0 0 15px rgba(240, 225, 48, 0.5), 0 0 30px rgba(240, 225, 48, 0.2);
 }
 .wa-lcd-kbps {
   font-family: 'Courier New', monospace;
-  font-size: 9px;
-  color: var(--wa-green2);
+  font-size: 10px;
+  color: var(--neon-cyan);
+  text-shadow: 0 0 8px rgba(0, 255, 255, 0.4);
 }
 .wa-lcd-status {
   font-family: 'Courier New', monospace;
-  font-size: 9px;
-  color: var(--wa-green2);
+  font-size: 10px;
+  color: var(--neon-green);
+  text-shadow: 0 0 8px rgba(57, 255, 20, 0.4);
 }
 
 /* ---- Seek bar ---- */
@@ -1968,7 +2142,8 @@ input[type="checkbox"] {
       if (this.audioCtx) return;
       this.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
       this.analyser = this.audioCtx.createAnalyser();
-      this.analyser.fftSize = 128;
+      this.analyser.fftSize = 256;
+      this.analyser.smoothingTimeConstant = 0.7;
       this.source = this.audioCtx.createMediaElementSource(this.audio);
       this.source.connect(this.analyser);
       this.analyser.connect(this.audioCtx.destination);
@@ -1982,38 +2157,120 @@ input[type="checkbox"] {
       const bufLen = analyser.frequencyBinCount;
       const dataArr = new Uint8Array(bufLen);
 
+      // Peak hold values for each bar
+      const peaks = new Float32Array(64).fill(0);
+      const peakDecay = 0.97;
+      const peakDropSpeed = 0.015;
+
+      // Color palette - neon banana
+      const colors = {
+        low: { r: 255, g: 0, b: 255 },      // magenta for bass
+        mid: { r: 240, g: 225, b: 48 },     // yellow for mids
+        high: { r: 0, g: 255, b: 255 },     // cyan for highs
+        peak: { r: 255, g: 255, b: 255 }    // white peaks
+      };
+
       const draw = () => {
         this.vizAnimId = requestAnimationFrame(draw);
-        const w = canvas.width = canvas.clientWidth;
-        const h = canvas.height = canvas.clientHeight;
+        const w = canvas.width = canvas.clientWidth * 2; // 2x for retina
+        const h = canvas.height = canvas.clientHeight * 2;
+        canvas.style.width = canvas.clientWidth + 'px';
+        canvas.style.height = canvas.clientHeight + 'px';
+
         analyser.getByteFrequencyData(dataArr);
 
-        ctx.fillStyle = '#000';
+        // Clear with subtle fade for trail effect
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.3)';
         ctx.fillRect(0, 0, w, h);
 
-        const barCount = 32;
-        const barWidth = Math.floor(w / barCount) - 1;
+        const barCount = 48;
+        const gap = 2;
+        const barWidth = Math.floor((w - gap * barCount) / barCount);
         const step = Math.floor(bufLen / barCount);
 
         for (let i = 0; i < barCount; i++) {
-          const val = dataArr[i * step] / 255;
-          const barH = val * h;
+          // Average nearby frequencies for smoother visualization
+          let sum = 0;
+          for (let j = 0; j < step; j++) {
+            sum += dataArr[i * step + j] || 0;
+          }
+          const val = (sum / step) / 255;
+          const barH = val * h * 0.9;
 
-          // Classic green gradient
-          const grad = ctx.createLinearGradient(0, h - barH, 0, h);
-          grad.addColorStop(0, '#00ff00');
-          grad.addColorStop(0.6, '#00cc00');
-          grad.addColorStop(1, '#006600');
+          // Update peak
+          if (val > peaks[i]) {
+            peaks[i] = val;
+          } else {
+            peaks[i] = Math.max(peaks[i] * peakDecay - peakDropSpeed, 0);
+          }
+
+          const x = i * (barWidth + gap);
+          const freq = i / barCount; // 0 = low, 1 = high
+
+          // Create gradient based on frequency range
+          const grad = ctx.createLinearGradient(x, h, x, h - barH);
+
+          if (freq < 0.33) {
+            // Bass - magenta to pink
+            grad.addColorStop(0, 'rgba(255, 0, 128, 0.9)');
+            grad.addColorStop(0.5, 'rgba(255, 0, 255, 0.8)');
+            grad.addColorStop(1, 'rgba(255, 100, 255, 0.6)');
+          } else if (freq < 0.66) {
+            // Mids - yellow to orange
+            grad.addColorStop(0, 'rgba(255, 180, 0, 0.9)');
+            grad.addColorStop(0.5, 'rgba(240, 225, 48, 0.8)');
+            grad.addColorStop(1, 'rgba(255, 255, 100, 0.6)');
+          } else {
+            // Highs - cyan to white
+            grad.addColorStop(0, 'rgba(0, 200, 255, 0.9)');
+            grad.addColorStop(0.5, 'rgba(0, 255, 255, 0.8)');
+            grad.addColorStop(1, 'rgba(150, 255, 255, 0.6)');
+          }
+
           ctx.fillStyle = grad;
 
-          const x = i * (barWidth + 1);
-          ctx.fillRect(x, h - barH, barWidth, barH);
+          // Draw bar with rounded top
+          const radius = Math.min(barWidth / 2, 4);
+          ctx.beginPath();
+          ctx.moveTo(x, h);
+          ctx.lineTo(x, h - barH + radius);
+          ctx.arcTo(x, h - barH, x + radius, h - barH, radius);
+          ctx.arcTo(x + barWidth, h - barH, x + barWidth, h - barH + radius, radius);
+          ctx.lineTo(x + barWidth, h);
+          ctx.fill();
 
-          // Peak dot
-          if (val > 0.05) {
-            ctx.fillStyle = '#00ff66';
-            ctx.fillRect(x, h - barH - 3, barWidth, 2);
+          // Glow effect
+          ctx.shadowBlur = 15;
+          ctx.shadowColor = freq < 0.33 ? '#ff00ff' : freq < 0.66 ? '#f0e130' : '#00ffff';
+          ctx.fill();
+          ctx.shadowBlur = 0;
+
+          // Peak indicator with glow
+          if (peaks[i] > 0.05) {
+            const peakY = h - peaks[i] * h * 0.9;
+            ctx.fillStyle = '#ffffff';
+            ctx.shadowBlur = 8;
+            ctx.shadowColor = '#ffffff';
+            ctx.fillRect(x, peakY - 3, barWidth, 3);
+            ctx.shadowBlur = 0;
           }
+
+          // Reflection effect (subtle)
+          const reflectGrad = ctx.createLinearGradient(x, h, x, h + barH * 0.3);
+          reflectGrad.addColorStop(0, 'rgba(255, 255, 255, 0.1)');
+          reflectGrad.addColorStop(1, 'rgba(255, 255, 255, 0)');
+          ctx.fillStyle = reflectGrad;
+          ctx.fillRect(x, h, barWidth, barH * 0.3);
+        }
+
+        // Add subtle scanlines
+        ctx.strokeStyle = 'rgba(0, 0, 0, 0.1)';
+        ctx.lineWidth = 1;
+        for (let y = 0; y < h; y += 4) {
+          ctx.beginPath();
+          ctx.moveTo(0, y);
+          ctx.lineTo(w, y);
+          ctx.stroke();
         }
       };
       draw();

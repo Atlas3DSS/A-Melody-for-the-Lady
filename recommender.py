@@ -802,6 +802,334 @@ def cmd_crawl(args):
 
 
 # ---------------------------------------------------------------------------
+# Feature: Smart Playlist Generator
+# ---------------------------------------------------------------------------
+TAGS_FILE = "track_tags.json"
+
+
+def generate_playlist(emb_data: dict, seed_id: str, length_minutes: int = 60,
+                      drift: float = 0.3, avoid_recent: int = 5) -> list[dict]:
+    """Generate a flowing playlist starting from a seed track.
+
+    Args:
+        emb_data: Embeddings data
+        seed_id: Starting track video ID
+        length_minutes: Target playlist length in minutes (assumes ~3.5 min/track)
+        drift: How much the playlist can evolve (0=stay similar, 1=explore more)
+        avoid_recent: Don't repeat tracks within this many selections
+
+    Returns:
+        List of track entries in playlist order
+    """
+    ids = emb_data["ids"]
+    if seed_id not in ids:
+        print(f"Seed track '{seed_id}' not found in embeddings.")
+        return []
+
+    # Estimate number of tracks (assume avg 3.5 min per track)
+    num_tracks = max(1, int(length_minutes / 3.5))
+
+    clap_all = emb_data["clap"]
+
+    # Normalize all embeddings once
+    norms = np.linalg.norm(clap_all, axis=1, keepdims=True)
+    norms = np.where(norms == 0, 1, norms)
+    clap_normed = clap_all / norms
+
+    playlist = []
+    used_indices = set()
+    current_idx = ids.index(seed_id)
+
+    for i in range(num_tracks):
+        playlist.append({
+            "id": ids[current_idx],
+            "title": emb_data["titles"][current_idx],
+            "position": i + 1,
+        })
+        used_indices.add(current_idx)
+
+        if i >= num_tracks - 1:
+            break
+
+        # Get current track's embedding
+        current_emb = clap_normed[current_idx]
+
+        # Calculate similarities to all tracks
+        sims = clap_normed @ current_emb
+
+        # Apply drift: blend current similarity with exploration
+        # Higher drift = more randomness in selection
+        if drift > 0:
+            noise = np.random.random(len(sims)) * drift * 0.5
+            sims = sims * (1 - drift * 0.3) + noise
+
+        # Mask out used tracks (especially recent ones to avoid loops)
+        recent_penalty = list(used_indices)[-avoid_recent:] if len(used_indices) > avoid_recent else list(used_indices)
+        for idx in used_indices:
+            if idx in recent_penalty:
+                sims[idx] = -1  # Strong penalty for recent
+            else:
+                sims[idx] = sims[idx] * 0.5  # Soft penalty for older
+
+        # Select next track from top candidates with some randomness
+        top_k = min(10, len(ids) - len(used_indices))
+        if top_k <= 0:
+            break
+
+        top_indices = np.argsort(-sims)[:top_k * 2]
+        valid_indices = [idx for idx in top_indices if idx not in recent_penalty][:top_k]
+
+        if not valid_indices:
+            break
+
+        # Weighted random selection from top candidates
+        weights = np.array([sims[idx] for idx in valid_indices])
+        weights = np.maximum(weights, 0.01)  # Ensure positive
+        weights = weights / weights.sum()
+
+        current_idx = np.random.choice(valid_indices, p=weights)
+
+    return playlist
+
+
+def save_playlist_m3u(playlist: list[dict], music_dir: Path, output_path: Path):
+    """Save playlist as M3U file."""
+    lines = ["#EXTM3U"]
+
+    for track in playlist:
+        vid_id = track["id"]
+        title = track["title"]
+
+        # Find the actual audio file
+        audio_file = None
+        for f in music_dir.iterdir():
+            if f"[{vid_id}]" in f.name and f.suffix in AUDIO_EXTENSIONS:
+                audio_file = f
+                break
+
+        if audio_file:
+            lines.append(f"#EXTINF:-1,{title}")
+            lines.append(str(audio_file))
+
+    output_path.write_text("\n".join(lines), encoding="utf-8")
+    print(f"Saved playlist to: {output_path}")
+
+
+def cmd_playlist(args):
+    """Generate a smart playlist."""
+    music_dir = Path(args.output)
+    emb_data = load_embeddings(music_dir)
+
+    playlist = generate_playlist(
+        emb_data,
+        seed_id=args.seed,
+        length_minutes=args.length,
+        drift=args.drift,
+    )
+
+    if not playlist:
+        return
+
+    seed_title = emb_data["titles"][emb_data["ids"].index(args.seed)]
+    safe_title = seed_title.encode('ascii', 'replace').decode('ascii')
+    print(f"Generated playlist from: {safe_title[:60]}")
+    print(f"  Length: {args.length} min (~{len(playlist)} tracks)")
+    print(f"  Drift: {args.drift}\n")
+
+    for track in playlist:
+        safe_t = track['title'][:55].encode('ascii', 'replace').decode('ascii')
+        print(f"  {track['position']:2d}. {safe_t}")
+
+    if args.save:
+        output_path = music_dir / f"playlist_{args.seed}_{args.length}min.m3u"
+        save_playlist_m3u(playlist, music_dir, output_path)
+
+
+# ---------------------------------------------------------------------------
+# Feature: Auto-Tagging
+# ---------------------------------------------------------------------------
+DEFAULT_TAGS = [
+    "energetic", "chill", "dark", "uplifting", "heavy", "melodic",
+    "electronic", "rock", "hip-hop", "ambient", "aggressive", "dreamy",
+    "fast", "slow", "vocals", "instrumental"
+]
+
+
+def tag_tracks(emb_data: dict, model, processor, labels: list[str],
+               device="cuda", threshold: float = 0.01) -> dict:
+    """Tag all tracks with labels using CLAP text-audio similarity.
+
+    Returns:
+        Dict mapping video_id -> {label: score, ...}
+    """
+    torch = _import_torch()
+
+    # Encode all labels
+    print(f"Encoding {len(labels)} labels...")
+    label_embeddings = []
+    for label in labels:
+        emb = encode_text_clap(model, processor, label, device=device)
+        label_embeddings.append(emb)
+    label_matrix = np.stack(label_embeddings)  # [num_labels, 512]
+
+    # Normalize
+    label_norms = np.linalg.norm(label_matrix, axis=1, keepdims=True)
+    label_matrix = label_matrix / np.where(label_norms == 0, 1, label_norms)
+
+    clap_all = emb_data["clap"]
+    clap_norms = np.linalg.norm(clap_all, axis=1, keepdims=True)
+    clap_normed = clap_all / np.where(clap_norms == 0, 1, clap_norms)
+
+    # Compute all similarities: [num_tracks, num_labels]
+    print(f"Computing similarities for {len(emb_data['ids'])} tracks...")
+    all_sims = clap_normed @ label_matrix.T
+
+    # Build tags dict
+    tags = {}
+    for i, vid_id in enumerate(emb_data["ids"]):
+        track_tags = {}
+        for j, label in enumerate(labels):
+            score = float(all_sims[i, j])
+            if score >= threshold:
+                track_tags[label] = round(score, 4)
+        tags[vid_id] = track_tags
+
+    return tags
+
+
+def save_tags(music_dir: Path, tags: dict):
+    """Save tags to JSON file."""
+    import json
+    path = music_dir / TAGS_FILE
+    path.write_text(json.dumps(tags, indent=2))
+    print(f"Saved tags to: {path}")
+
+
+def load_tags(music_dir: Path) -> dict:
+    """Load tags from JSON file."""
+    import json
+    path = music_dir / TAGS_FILE
+    if path.exists():
+        return json.loads(path.read_text())
+    return {}
+
+
+def cmd_tag(args):
+    """Auto-tag tracks with mood/genre labels."""
+    torch = _import_torch()
+    music_dir = Path(args.output)
+    emb_data = load_embeddings(music_dir)
+
+    # Parse labels
+    if args.labels:
+        labels = [l.strip() for l in args.labels.split(",")]
+    else:
+        labels = DEFAULT_TAGS
+
+    print(f"Tagging {len(emb_data['ids'])} tracks with {len(labels)} labels:")
+    print(f"  {', '.join(labels)}\n")
+
+    clap_model, clap_processor = load_clap(device=args.device)
+
+    tags = tag_tracks(emb_data, clap_model, clap_processor, labels,
+                      device=args.device, threshold=args.threshold)
+
+    save_tags(music_dir, tags)
+
+    # Show summary
+    label_counts = {l: 0 for l in labels}
+    for vid_id, track_tags in tags.items():
+        for label in track_tags:
+            if label in label_counts:
+                label_counts[label] += 1
+
+    print(f"\nTag distribution:")
+    for label, count in sorted(label_counts.items(), key=lambda x: -x[1]):
+        pct = count / len(tags) * 100
+        bar = "#" * int(pct / 2)
+        print(f"  {label:12s} {count:4d} ({pct:5.1f}%) {bar}")
+
+
+# ---------------------------------------------------------------------------
+# Feature: Duplicate Detection
+# ---------------------------------------------------------------------------
+def find_duplicates(emb_data: dict, threshold: float = 0.95) -> list[tuple]:
+    """Find duplicate or near-duplicate tracks.
+
+    Returns:
+        List of (id1, id2, similarity, title1, title2) tuples
+    """
+    ids = emb_data["ids"]
+    titles = emb_data["titles"]
+    clap_all = emb_data["clap"]
+
+    # Normalize
+    norms = np.linalg.norm(clap_all, axis=1, keepdims=True)
+    norms = np.where(norms == 0, 1, norms)
+    clap_normed = clap_all / norms
+
+    # Compute full similarity matrix
+    print(f"Computing similarity matrix for {len(ids)} tracks...")
+    sim_matrix = clap_normed @ clap_normed.T
+
+    # Find pairs above threshold (only upper triangle to avoid duplicates)
+    duplicates = []
+    for i in range(len(ids)):
+        for j in range(i + 1, len(ids)):
+            if sim_matrix[i, j] >= threshold:
+                duplicates.append((
+                    ids[i], ids[j],
+                    float(sim_matrix[i, j]),
+                    titles[i], titles[j]
+                ))
+
+    # Sort by similarity (highest first)
+    duplicates.sort(key=lambda x: -x[2])
+
+    return duplicates
+
+
+def cmd_duplicates(args):
+    """Find duplicate or near-duplicate tracks."""
+    music_dir = Path(args.output)
+    emb_data = load_embeddings(music_dir)
+
+    print(f"Scanning {len(emb_data['ids'])} tracks for duplicates (threshold: {args.threshold})...\n")
+
+    duplicates = find_duplicates(emb_data, threshold=args.threshold)
+
+    if not duplicates:
+        print("No duplicates found!")
+        return
+
+    print(f"Found {len(duplicates)} potential duplicate pairs:\n")
+
+    for i, (id1, id2, sim, title1, title2) in enumerate(duplicates[:args.limit], 1):
+        safe_t1 = title1[:40].encode('ascii', 'replace').decode('ascii')
+        safe_t2 = title2[:40].encode('ascii', 'replace').decode('ascii')
+        print(f"{i:3d}. [{sim:.3f}] Similarity")
+        print(f"     A: {safe_t1}")
+        print(f"        id={id1}")
+        print(f"     B: {safe_t2}")
+        print(f"        id={id2}")
+        print()
+
+    if len(duplicates) > args.limit:
+        print(f"  ... and {len(duplicates) - args.limit} more pairs")
+
+    # Save to file if requested
+    if args.save:
+        import json
+        output_path = music_dir / "duplicates.json"
+        data = [{
+            "id1": d[0], "id2": d[1], "similarity": d[2],
+            "title1": d[3], "title2": d[4]
+        } for d in duplicates]
+        output_path.write_text(json.dumps(data, indent=2))
+        print(f"\nSaved to: {output_path}")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
@@ -844,6 +1172,32 @@ def main():
     p_crawl.add_argument("--round", type=int, default=1,
                          help="Crawl round: 1=library seeds only, 2+=include discoveries")
 
+    # playlist - Smart Playlist Generator
+    p_playlist = sub.add_parser("playlist", help="Generate a smart playlist from a seed track")
+    p_playlist.add_argument("--seed", required=True, help="Video ID of the seed track")
+    p_playlist.add_argument("--length", type=int, default=60,
+                            help="Target playlist length in minutes (default: 60)")
+    p_playlist.add_argument("--drift", type=float, default=0.3,
+                            help="How much playlist can evolve: 0=stay similar, 1=explore (default: 0.3)")
+    p_playlist.add_argument("--save", action="store_true",
+                            help="Save playlist as M3U file")
+
+    # tag - Auto-Tagging
+    p_tag = sub.add_parser("tag", help="Auto-tag tracks with mood/genre labels")
+    p_tag.add_argument("--labels", type=str, default=None,
+                       help="Comma-separated labels (default: energetic,chill,dark,uplifting,...)")
+    p_tag.add_argument("--threshold", type=float, default=0.005,
+                       help="Minimum score to assign tag (default: 0.005)")
+
+    # duplicates - Duplicate Detection
+    p_dup = sub.add_parser("duplicates", help="Find duplicate or near-duplicate tracks")
+    p_dup.add_argument("--threshold", type=float, default=0.95,
+                       help="Similarity threshold (default: 0.95)")
+    p_dup.add_argument("--limit", type=int, default=50,
+                       help="Max pairs to display (default: 50)")
+    p_dup.add_argument("--save", action="store_true",
+                       help="Save results to duplicates.json")
+
     args = parser.parse_args()
 
     if args.command == "embed":
@@ -856,6 +1210,12 @@ def main():
         cmd_info(args)
     elif args.command == "crawl":
         cmd_crawl(args)
+    elif args.command == "playlist":
+        cmd_playlist(args)
+    elif args.command == "tag":
+        cmd_tag(args)
+    elif args.command == "duplicates":
+        cmd_duplicates(args)
     else:
         parser.print_help()
 
