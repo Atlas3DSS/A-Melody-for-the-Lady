@@ -12,9 +12,11 @@ Usage:
 import argparse
 import json
 import mimetypes
+import os
 import platform
 import queue
 import random
+import re as regex
 import subprocess as _subprocess
 import threading
 import time
@@ -22,6 +24,106 @@ import webbrowser
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import unquote, parse_qs
+
+# Load .env file for API keys
+def load_dotenv(path: Path):
+    """Load environment variables from .env file."""
+    if path.exists():
+        for line in path.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith('#') and '=' in line:
+                key, _, value = line.partition('=')
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                os.environ.setdefault(key, value)
+
+load_dotenv(Path(__file__).parent / ".env")
+
+# Gemini integration for YouTube search
+# Try GEMINI_API_KEY first, fall back to GOOGLE_API_KEY
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+_gemini_client = None
+
+def get_gemini_client():
+    """Lazy-load Gemini client."""
+    global _gemini_client
+    if _gemini_client is None and GEMINI_API_KEY:
+        try:
+            from google import genai
+            _gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+        except ImportError:
+            print("google-genai not installed. YouTube suggestions disabled.")
+    return _gemini_client
+
+def search_youtube_via_gemini(query: str, num_results: int = 8) -> tuple[list[dict], str]:
+    """
+    Use Gemini with Google Search to find YouTube music videos.
+    Returns tuple of (results, error_message).
+    results is list of {id, title, channel, description}.
+    """
+    client = get_gemini_client()
+    if not client:
+        return [], "Gemini API not configured"
+
+    try:
+        from google.genai import types
+
+        prompt = f"""Find {num_results} YouTube music videos similar to or matching: "{query}"
+
+Search for actual YouTube videos. For each result, extract:
+- The YouTube video ID (the 11-character code from the URL like "dQw4w9WgXcQ")
+- The video title
+- The channel name
+- A brief description
+
+Return ONLY a JSON array with this exact format, no other text:
+[
+  {{"id": "VIDEO_ID", "title": "Video Title", "channel": "Channel Name", "description": "Brief description"}}
+]
+
+Focus on finding high-quality music videos, official uploads, or well-known covers."""
+
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                tools=[types.Tool(google_search=types.GoogleSearch())],
+                temperature=0.3,
+            )
+        )
+
+        # Extract JSON from response
+        text = response.text.strip()
+        # Find JSON array in response
+        start = text.find('[')
+        end = text.rfind(']') + 1
+        if start >= 0 and end > start:
+            json_str = text[start:end]
+            results = json.loads(json_str)
+            # Validate and clean results
+            valid_results = []
+            for r in results:
+                if isinstance(r, dict) and 'id' in r and 'title' in r:
+                    vid_id = r['id']
+                    # Validate YouTube ID format (11 chars, alphanumeric + _ -)
+                    if regex.match(r'^[a-zA-Z0-9_-]{11}$', vid_id):
+                        valid_results.append({
+                            'id': vid_id,
+                            'title': r.get('title', 'Unknown'),
+                            'channel': r.get('channel', ''),
+                            'description': r.get('description', ''),
+                            'source': 'youtube'
+                        })
+            return valid_results[:num_results], ""
+        return [], "No results found"
+    except Exception as e:
+        error_str = str(e)
+        if "PERMISSION_DENIED" in error_str or "leaked" in error_str.lower():
+            return [], "API key issue - please update .env"
+        elif "RESOURCE_EXHAUSTED" in error_str or "quota" in error_str.lower():
+            return [], "API quota exceeded - try again later"
+        print(f"Gemini search error: {e}")
+        return [], f"Search failed: {str(e)[:50]}"
 
 from playlist_dl import (
     PLAYLIST_URL,
@@ -312,6 +414,8 @@ class Handler(BaseHTTPRequestHandler):
             self._api_playlist(seed_id, qs)
         elif path == "/api/duplicates":
             self._api_duplicates(qs)
+        elif path == "/api/youtube-search":
+            self._api_youtube_search(qs)
         else:
             self.send_error(404)
 
@@ -620,6 +724,26 @@ class Handler(BaseHTTPRequestHandler):
             })
 
         self._json_response({"duplicates": results, "total": len(duplicates)})
+
+    def _api_youtube_search(self, qs: str):
+        """Search YouTube for similar music via Gemini."""
+        params = parse_qs(qs)
+        query = params.get("q", [""])[0]
+        n = int(params.get("n", ["8"])[0])
+
+        if not query:
+            self._json_response({"error": "No query provided"}, 400)
+            return
+
+        if not GEMINI_API_KEY:
+            self._json_response({"query": query, "results": [], "message": "Gemini API key not configured"})
+            return
+
+        results, error_msg = search_youtube_via_gemini(query, num_results=n)
+        response = {"query": query, "results": results}
+        if error_msg:
+            response["message"] = error_msg
+        self._json_response(response)
 
     def _api_audio(self, video_id: str):
         """Serve audio file with HTTP Range support for seeking."""
@@ -1395,9 +1519,47 @@ input[type="checkbox"] {
 .modal-overlay.active { display: flex; }
 .modal {
   background: var(--bg2); border: 1px solid var(--border);
-  border-radius: 12px; width: 620px; max-width: 92vw;
-  max-height: 80vh; display: flex; flex-direction: column;
+  border-radius: 12px; width: 900px; max-width: 95vw;
+  max-height: 85vh; display: flex; flex-direction: column;
   overflow: hidden; box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+}
+.modal.dual-panel { width: 1100px; }
+.dual-panel-container {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0;
+  height: 100%;
+  overflow: hidden;
+}
+.dual-panel-container .panel {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border-right: 1px solid var(--border);
+}
+.dual-panel-container .panel:last-child { border-right: none; }
+.panel-header {
+  padding: 0.75rem 1rem;
+  background: var(--bg3);
+  border-bottom: 1px solid var(--border);
+  font-weight: 600;
+  font-size: 0.85rem;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-shrink: 0;
+}
+.panel-header .icon { font-size: 1.1rem; }
+.panel-header.local { color: var(--neon-green); }
+.panel-header.youtube { color: var(--red); }
+.panel-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0;
+}
+@media (max-width: 800px) {
+  .dual-panel-container { grid-template-columns: 1fr; }
+  .modal.dual-panel { width: 95vw; }
 }
 .modal-header {
   padding: 1rem 1.25rem; border-bottom: 1px solid var(--border);
@@ -2136,14 +2298,22 @@ input[type="checkbox"] {
     initVisualizer() {
       this.vizCanvas = $('wa-viz-canvas');
       this.vizCtx = this.vizCanvas.getContext('2d');
+      this.vizMode = 0; // 0=bars, 1=wave, 2=circular, 3=particles
+      this.vizModes = ['bars', 'wave', 'circular', 'particles'];
+      this.particles = [];
+
+      // Click to change viz mode
+      this.vizCanvas.addEventListener('click', () => {
+        this.vizMode = (this.vizMode + 1) % this.vizModes.length;
+      });
     },
 
     ensureAudioContext() {
       if (this.audioCtx) return;
       this.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
       this.analyser = this.audioCtx.createAnalyser();
-      this.analyser.fftSize = 256;
-      this.analyser.smoothingTimeConstant = 0.7;
+      this.analyser.fftSize = 512;
+      this.analyser.smoothingTimeConstant = 0.75;
       this.source = this.audioCtx.createMediaElementSource(this.audio);
       this.source.connect(this.analyser);
       this.analyser.connect(this.audioCtx.destination);
@@ -2154,124 +2324,237 @@ input[type="checkbox"] {
       const canvas = this.vizCanvas;
       const ctx = this.vizCtx;
       const analyser = this.analyser;
-      const bufLen = analyser.frequencyBinCount;
-      const dataArr = new Uint8Array(bufLen);
+      const freqBufLen = analyser.frequencyBinCount;
+      const freqData = new Uint8Array(freqBufLen);
+      const timeData = new Uint8Array(freqBufLen);
+      const self = this;
 
-      // Peak hold values for each bar
+      // State for visualizations
       const peaks = new Float32Array(64).fill(0);
       const peakDecay = 0.97;
-      const peakDropSpeed = 0.015;
+      let rotation = 0;
+      let hueShift = 0;
 
-      // Color palette - neon banana
-      const colors = {
-        low: { r: 255, g: 0, b: 255 },      // magenta for bass
-        mid: { r: 240, g: 225, b: 48 },     // yellow for mids
-        high: { r: 0, g: 255, b: 255 },     // cyan for highs
-        peak: { r: 255, g: 255, b: 255 }    // white peaks
-      };
+      // Particle system
+      class Particle {
+        constructor(x, y, energy) {
+          this.x = x;
+          this.y = y;
+          this.vx = (Math.random() - 0.5) * energy * 8;
+          this.vy = -Math.random() * energy * 12 - 2;
+          this.life = 1;
+          this.decay = 0.015 + Math.random() * 0.02;
+          this.size = 2 + Math.random() * 4 * energy;
+          this.hue = Math.random() * 60 + 40; // yellow-ish
+        }
+        update() {
+          this.x += this.vx;
+          this.vy += 0.15; // gravity
+          this.y += this.vy;
+          this.life -= this.decay;
+        }
+        draw(ctx) {
+          if (this.life <= 0) return;
+          ctx.beginPath();
+          ctx.arc(this.x, this.y, this.size * this.life, 0, Math.PI * 2);
+          ctx.fillStyle = `hsla(${this.hue}, 100%, 60%, ${this.life * 0.8})`;
+          ctx.shadowBlur = 15;
+          ctx.shadowColor = `hsla(${this.hue}, 100%, 60%, 0.5)`;
+          ctx.fill();
+          ctx.shadowBlur = 0;
+        }
+      }
 
-      const draw = () => {
-        this.vizAnimId = requestAnimationFrame(draw);
-        const w = canvas.width = canvas.clientWidth * 2; // 2x for retina
-        const h = canvas.height = canvas.clientHeight * 2;
-        canvas.style.width = canvas.clientWidth + 'px';
-        canvas.style.height = canvas.clientHeight + 'px';
-
-        analyser.getByteFrequencyData(dataArr);
-
-        // Clear with subtle fade for trail effect
-        ctx.fillStyle = 'rgba(0, 0, 0, 0.3)';
-        ctx.fillRect(0, 0, w, h);
-
+      const drawBars = (w, h) => {
         const barCount = 48;
         const gap = 2;
         const barWidth = Math.floor((w - gap * barCount) / barCount);
-        const step = Math.floor(bufLen / barCount);
+        const step = Math.floor(freqBufLen / barCount);
 
         for (let i = 0; i < barCount; i++) {
-          // Average nearby frequencies for smoother visualization
           let sum = 0;
-          for (let j = 0; j < step; j++) {
-            sum += dataArr[i * step + j] || 0;
-          }
+          for (let j = 0; j < step; j++) sum += freqData[i * step + j] || 0;
           const val = (sum / step) / 255;
-          const barH = val * h * 0.9;
+          const barH = val * h * 0.85;
 
-          // Update peak
-          if (val > peaks[i]) {
-            peaks[i] = val;
-          } else {
-            peaks[i] = Math.max(peaks[i] * peakDecay - peakDropSpeed, 0);
-          }
+          if (val > peaks[i]) peaks[i] = val;
+          else peaks[i] = Math.max(peaks[i] * peakDecay - 0.015, 0);
 
           const x = i * (barWidth + gap);
-          const freq = i / barCount; // 0 = low, 1 = high
+          const freq = i / barCount;
 
-          // Create gradient based on frequency range
           const grad = ctx.createLinearGradient(x, h, x, h - barH);
-
           if (freq < 0.33) {
-            // Bass - magenta to pink
             grad.addColorStop(0, 'rgba(255, 0, 128, 0.9)');
-            grad.addColorStop(0.5, 'rgba(255, 0, 255, 0.8)');
             grad.addColorStop(1, 'rgba(255, 100, 255, 0.6)');
           } else if (freq < 0.66) {
-            // Mids - yellow to orange
             grad.addColorStop(0, 'rgba(255, 180, 0, 0.9)');
-            grad.addColorStop(0.5, 'rgba(240, 225, 48, 0.8)');
             grad.addColorStop(1, 'rgba(255, 255, 100, 0.6)');
           } else {
-            // Highs - cyan to white
             grad.addColorStop(0, 'rgba(0, 200, 255, 0.9)');
-            grad.addColorStop(0.5, 'rgba(0, 255, 255, 0.8)');
             grad.addColorStop(1, 'rgba(150, 255, 255, 0.6)');
           }
 
           ctx.fillStyle = grad;
-
-          // Draw bar with rounded top
-          const radius = Math.min(barWidth / 2, 4);
-          ctx.beginPath();
-          ctx.moveTo(x, h);
-          ctx.lineTo(x, h - barH + radius);
-          ctx.arcTo(x, h - barH, x + radius, h - barH, radius);
-          ctx.arcTo(x + barWidth, h - barH, x + barWidth, h - barH + radius, radius);
-          ctx.lineTo(x + barWidth, h);
-          ctx.fill();
-
-          // Glow effect
-          ctx.shadowBlur = 15;
+          ctx.shadowBlur = 12;
           ctx.shadowColor = freq < 0.33 ? '#ff00ff' : freq < 0.66 ? '#f0e130' : '#00ffff';
-          ctx.fill();
+          ctx.fillRect(x, h - barH, barWidth, barH);
           ctx.shadowBlur = 0;
 
-          // Peak indicator with glow
           if (peaks[i] > 0.05) {
-            const peakY = h - peaks[i] * h * 0.9;
-            ctx.fillStyle = '#ffffff';
+            ctx.fillStyle = '#fff';
             ctx.shadowBlur = 8;
-            ctx.shadowColor = '#ffffff';
-            ctx.fillRect(x, peakY - 3, barWidth, 3);
+            ctx.shadowColor = '#fff';
+            ctx.fillRect(x, h - peaks[i] * h * 0.85 - 3, barWidth, 3);
             ctx.shadowBlur = 0;
           }
-
-          // Reflection effect (subtle)
-          const reflectGrad = ctx.createLinearGradient(x, h, x, h + barH * 0.3);
-          reflectGrad.addColorStop(0, 'rgba(255, 255, 255, 0.1)');
-          reflectGrad.addColorStop(1, 'rgba(255, 255, 255, 0)');
-          ctx.fillStyle = reflectGrad;
-          ctx.fillRect(x, h, barWidth, barH * 0.3);
         }
+      };
 
-        // Add subtle scanlines
-        ctx.strokeStyle = 'rgba(0, 0, 0, 0.1)';
-        ctx.lineWidth = 1;
-        for (let y = 0; y < h; y += 4) {
+      const drawWave = (w, h) => {
+        analyser.getByteTimeDomainData(timeData);
+        const centerY = h / 2;
+
+        // Draw multiple waves with different colors
+        const colors = ['#ff00ff', '#f0e130', '#00ffff'];
+        colors.forEach((color, layer) => {
           ctx.beginPath();
-          ctx.moveTo(0, y);
-          ctx.lineTo(w, y);
+          ctx.strokeStyle = color;
+          ctx.lineWidth = 3 - layer;
+          ctx.shadowBlur = 20;
+          ctx.shadowColor = color;
+
+          const offset = layer * 2;
+          for (let i = 0; i < freqBufLen; i++) {
+            const x = (i / freqBufLen) * w;
+            const v = (timeData[i] / 128.0) - 1;
+            const y = centerY + v * (h / 2.5) * (1 + layer * 0.1);
+
+            if (i === 0) ctx.moveTo(x, y + offset);
+            else ctx.lineTo(x, y + offset);
+          }
+          ctx.stroke();
+          ctx.shadowBlur = 0;
+        });
+
+        // Draw center line
+        ctx.strokeStyle = 'rgba(240, 225, 48, 0.3)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(0, centerY);
+        ctx.lineTo(w, centerY);
+        ctx.stroke();
+      };
+
+      const drawCircular = (w, h) => {
+        const cx = w / 2;
+        const cy = h / 2;
+        const radius = Math.min(w, h) * 0.35;
+        const bars = 64;
+        rotation += 0.005;
+        hueShift = (hueShift + 0.5) % 360;
+
+        // Get average energy for pulsing
+        let avgEnergy = 0;
+        for (let i = 0; i < freqBufLen; i++) avgEnergy += freqData[i];
+        avgEnergy = avgEnergy / freqBufLen / 255;
+
+        const pulseRadius = radius * (1 + avgEnergy * 0.3);
+
+        for (let i = 0; i < bars; i++) {
+          const angle = (i / bars) * Math.PI * 2 + rotation;
+          const freqIdx = Math.floor((i / bars) * freqBufLen);
+          const val = freqData[freqIdx] / 255;
+          const barLen = val * radius * 0.8 + 5;
+
+          const x1 = cx + Math.cos(angle) * pulseRadius * 0.4;
+          const y1 = cy + Math.sin(angle) * pulseRadius * 0.4;
+          const x2 = cx + Math.cos(angle) * (pulseRadius * 0.4 + barLen);
+          const y2 = cy + Math.sin(angle) * (pulseRadius * 0.4 + barLen);
+
+          const hue = (i / bars) * 60 + hueShift; // yellow-cyan range
+          ctx.strokeStyle = `hsla(${hue}, 100%, 60%, 0.9)`;
+          ctx.lineWidth = 4;
+          ctx.shadowBlur = 15;
+          ctx.shadowColor = `hsla(${hue}, 100%, 50%, 0.6)`;
+          ctx.beginPath();
+          ctx.moveTo(x1, y1);
+          ctx.lineTo(x2, y2);
           ctx.stroke();
         }
+
+        // Inner glow circle
+        const innerGrad = ctx.createRadialGradient(cx, cy, 0, cx, cy, pulseRadius * 0.4);
+        innerGrad.addColorStop(0, `rgba(240, 225, 48, ${0.1 + avgEnergy * 0.2})`);
+        innerGrad.addColorStop(1, 'rgba(0, 0, 0, 0)');
+        ctx.fillStyle = innerGrad;
+        ctx.beginPath();
+        ctx.arc(cx, cy, pulseRadius * 0.4, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.shadowBlur = 0;
+      };
+
+      const drawParticles = (w, h) => {
+        // Get bass energy for particle spawning
+        let bassEnergy = 0;
+        for (let i = 0; i < 8; i++) bassEnergy += freqData[i];
+        bassEnergy = bassEnergy / 8 / 255;
+
+        // Spawn particles based on bass
+        if (bassEnergy > 0.5 && Math.random() < bassEnergy) {
+          const x = Math.random() * w;
+          self.particles.push(new Particle(x, h, bassEnergy));
+        }
+
+        // Also spawn from center on strong beats
+        if (bassEnergy > 0.7 && Math.random() < 0.3) {
+          self.particles.push(new Particle(w/2 + (Math.random()-0.5)*100, h*0.6, bassEnergy));
+        }
+
+        // Update and draw particles
+        self.particles = self.particles.filter(p => p.life > 0 && p.y < h + 50);
+        self.particles.forEach(p => {
+          p.update();
+          p.draw(ctx);
+        });
+
+        // Draw subtle frequency bars at bottom
+        const barCount = 32;
+        const barWidth = w / barCount;
+        for (let i = 0; i < barCount; i++) {
+          const val = freqData[Math.floor(i * freqBufLen / barCount)] / 255;
+          const barH = val * 30;
+          const hue = 50 + i * 2;
+          ctx.fillStyle = `hsla(${hue}, 100%, 60%, 0.4)`;
+          ctx.fillRect(i * barWidth, h - barH, barWidth - 1, barH);
+        }
+      };
+
+      const draw = () => {
+        self.vizAnimId = requestAnimationFrame(draw);
+        const w = canvas.width = canvas.clientWidth * 2;
+        const h = canvas.height = canvas.clientHeight * 2;
+        canvas.style.width = canvas.clientWidth + 'px';
+        canvas.style.height = canvas.clientHeight + 'px';
+
+        analyser.getByteFrequencyData(freqData);
+
+        // Clear with fade for trails
+        ctx.fillStyle = self.vizMode === 3 ? 'rgba(0,0,0,0.15)' : 'rgba(0,0,0,0.4)';
+        ctx.fillRect(0, 0, w, h);
+
+        // Draw based on mode
+        switch (self.vizMode) {
+          case 0: drawBars(w, h); break;
+          case 1: drawWave(w, h); break;
+          case 2: drawCircular(w, h); break;
+          case 3: drawParticles(w, h); break;
+        }
+
+        // Mode indicator
+        ctx.fillStyle = 'rgba(240, 225, 48, 0.5)';
+        ctx.font = '16px monospace';
+        ctx.fillText(self.vizModes[self.vizMode].toUpperCase(), 10, 20);
       };
       draw();
     },
@@ -2478,12 +2761,45 @@ input[type="checkbox"] {
 
   async function fetchSimilar(videoId) {
     showModal('Finding similar tracks...', true);
+    const modal = document.querySelector('.modal');
+    modal.classList.add('dual-panel');
+
     try {
-      const r = await fetch(`/api/similar/${videoId}?n=20`);
-      const data = await r.json();
-      if (data.error) { showModalError(data.error); return; }
-      showModalResults(`Similar to: ${data.query_title}`, data.results);
-    } catch(e) { showModalError('Failed to fetch: ' + e.message); }
+      // Fetch local similar tracks
+      const localPromise = fetch(`/api/similar/${videoId}?n=15`).then(r => r.json());
+
+      // Get the track title for YouTube search
+      const track = allTracks.find(t => t.id === videoId);
+      const queryTitle = track ? track.title : videoId;
+
+      // Start YouTube search in parallel
+      const ytPromise = fetch(`/api/youtube-search?q=${encodeURIComponent(queryTitle)}&n=10`)
+        .then(r => r.json())
+        .catch(() => ({ results: [] }));
+
+      const [localData, ytData] = await Promise.all([localPromise, ytPromise]);
+
+      if (localData.error) {
+        showModalError(localData.error);
+        return;
+      }
+
+      // Calculate if we need YouTube suggestions (avg score < 50%)
+      const avgScore = localData.results.length > 0
+        ? localData.results.reduce((sum, r) => sum + r.score, 0) / localData.results.length
+        : 0;
+      const needsYouTube = avgScore < 0.5 || localData.results.length < 5;
+
+      showDualPanelResults(
+        `Similar to: ${localData.query_title}`,
+        localData.results,
+        ytData.results || [],
+        needsYouTube,
+        ytData.message || ''
+      );
+    } catch(e) {
+      showModalError('Failed to fetch: ' + e.message);
+    }
   }
 
   async function doSemanticSearch(query) {
@@ -2511,6 +2827,7 @@ input[type="checkbox"] {
 
   function showModalResults(title, results) {
     $('modal-title').textContent = title;
+    document.querySelector('.modal').classList.remove('dual-panel');
     if (!results.length) {
       $('modal-body').innerHTML = '<div class="modal-error">No results found.</div>';
       return;
@@ -2541,6 +2858,78 @@ input[type="checkbox"] {
       );
     }
     $('modal-body').innerHTML = frags.join('');
+  }
+
+  function showDualPanelResults(title, localResults, ytResults, highlightYouTube, ytErrorMsg) {
+    $('modal-title').textContent = title;
+    document.querySelector('.modal').classList.add('dual-panel');
+
+    // Build local results panel
+    let localHtml = '';
+    if (localResults.length === 0) {
+      localHtml = '<div class="modal-error" style="padding:2rem">No local matches found.</div>';
+    } else {
+      for (let i = 0; i < localResults.length; i++) {
+        const r = localResults[i];
+        const pct = Math.round(r.score * 100);
+        const isDownloaded = allTracks.some(t => t.id === r.id && t.status === 'downloaded');
+        let actionBtns = '';
+        if (isDownloaded) {
+          actionBtns += `<button data-mplay="${r.id}" title="Play">&#9654;</button>`;
+          actionBtns += `<button data-mqueue="${r.id}" title="Queue">+</button>`;
+        }
+        actionBtns += `<button data-msim="${r.id}" title="Find similar">&#8776;</button>`;
+        localHtml += `<div class="sim-result">` +
+          `<span class="sim-rank">${i + 1}.</span>` +
+          `<div class="sim-score-bar"><div class="sim-score-fill" style="width:${pct}%"></div></div>` +
+          `<span class="sim-score">${pct}%</span>` +
+          `<span class="sim-title" title="${escHtml(r.title)}">${escHtml(r.title)}</span>` +
+          `<span class="sim-actions">${actionBtns}</span>` +
+          `</div>`;
+      }
+    }
+
+    // Build YouTube results panel
+    let ytHtml = '';
+    if (ytResults.length === 0) {
+      const msg = ytErrorMsg || 'No YouTube suggestions available';
+      ytHtml = `<div class="modal-loading" style="padding:2rem;color:var(--text2)">${escHtml(msg)}</div>`;
+    } else {
+      for (let i = 0; i < ytResults.length; i++) {
+        const r = ytResults[i];
+        const channel = r.channel ? ` <span style="color:var(--text2);font-size:0.75rem">- ${escHtml(r.channel)}</span>` : '';
+        const isAlreadyDownloaded = allTracks.some(t => t.id === r.id && t.status === 'downloaded');
+        let actionBtns = '';
+        if (isAlreadyDownloaded) {
+          actionBtns += `<button data-mplay="${r.id}" title="Play (already downloaded)">&#9654;</button>`;
+        } else {
+          actionBtns += `<button data-myt="${r.id}" title="Listen on YouTube">&#127911;</button>`;
+        }
+        ytHtml += `<div class="sim-result">` +
+          `<span class="sim-rank" style="color:var(--red)">${i + 1}.</span>` +
+          `<span class="sim-title" title="${escHtml(r.title)}" style="flex:1">${escHtml(r.title)}${channel}</span>` +
+          `<span class="sim-actions">${actionBtns}</span>` +
+          `</div>`;
+      }
+    }
+
+    // Indicator for when YouTube is highlighted
+    const ytIndicator = highlightYouTube && ytResults.length > 0
+      ? '<span style="color:var(--yellow);font-size:0.7rem;margin-left:8px">(low local matches - check these!)</span>'
+      : '';
+
+    $('modal-body').innerHTML = `
+      <div class="dual-panel-container">
+        <div class="panel">
+          <div class="panel-header local"><span class="icon">&#128190;</span> Your Library</div>
+          <div class="panel-body">${localHtml}</div>
+        </div>
+        <div class="panel">
+          <div class="panel-header youtube"><span class="icon">&#9654;</span> YouTube Suggestions${ytIndicator}</div>
+          <div class="panel-body">${ytHtml}</div>
+        </div>
+      </div>
+    `;
   }
 
   // Modal close
