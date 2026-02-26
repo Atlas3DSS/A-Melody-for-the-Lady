@@ -50,7 +50,12 @@ def _import_librosa():
 # Config
 # ---------------------------------------------------------------------------
 DEFAULT_MUSIC_DIR = Path.home() / "Music" / "playlist_download"
-ACE_VAE_PATH = Path("/home/orwel/dev_genius/ACE-Step-1.5/checkpoints/vae")
+# ACE-Step VAE path - check both Linux and Windows locations
+_LINUX_VAE_PATH = Path("/home/orwel/dev_genius/ACE-Step-1.5/checkpoints/vae")
+_WIN_VAE_PATH = Path.home() / "dev_genius" / "ACE-Step-1.5" / "checkpoints" / "vae"
+ACE_VAE_PATH = _LINUX_VAE_PATH if _LINUX_VAE_PATH.exists() else _WIN_VAE_PATH
+VAE_AVAILABLE = ACE_VAE_PATH.exists()
+
 CLAP_MODEL_ID = "laion/larger_clap_music"
 EMBEDDINGS_FILE = "embeddings.npz"
 DISCOVERY_EMBEDDINGS_FILE = "discovery_embeddings.npz"
@@ -434,6 +439,7 @@ def cmd_embed(args):
     torch = _import_torch()
     music_dir = Path(args.output)
     device = args.device
+    use_vae = VAE_AVAILABLE and not getattr(args, 'clap_only', False)
 
     audio_files = find_audio_files(music_dir)
     if not audio_files:
@@ -441,6 +447,8 @@ def cmd_embed(args):
         return
 
     print(f"Found {len(audio_files)} audio files in {music_dir}")
+    if not use_vae:
+        print("  NOTE: Running in CLAP-only mode (VAE not available or --clap-only specified)")
 
     # Load existing embeddings to resume
     emb_path = music_dir / EMBEDDINGS_FILE
@@ -459,7 +467,7 @@ def cmd_embed(args):
     print(f"Encoding {len(new_files)} new files...\n")
 
     # Load models
-    vae = load_vae(device=device)
+    vae = load_vae(device=device) if use_vae else None
     clap_model, clap_processor = load_clap(device=device)
     print()
 
@@ -473,15 +481,24 @@ def cmd_embed(args):
     for i, (vid_id, fpath) in enumerate(new_files):
         title = fpath.stem  # filename without extension
         pct = (i + 1) / len(new_files) * 100
-        print(f"[{i+1}/{len(new_files)}] ({pct:.0f}%) {title[:60]}")
+        # Handle Unicode characters that Windows console can't display
+        safe_title = title[:60].encode('ascii', 'replace').decode('ascii')
+        print(f"[{i+1}/{len(new_files)}] ({pct:.0f}%) {safe_title}")
 
-        v_emb = encode_vae(vae, fpath, device=device)
+        v_emb = encode_vae(vae, fpath, device=device) if use_vae else None
         c_emb = encode_clap(clap_model, clap_processor, fpath, device=device)
 
-        if v_emb is not None and c_emb is not None:
+        # In CLAP-only mode, only c_emb is required
+        if use_vae:
+            success = v_emb is not None and c_emb is not None
+        else:
+            success = c_emb is not None
+
+        if success:
             new_ids.append(vid_id)
             new_titles.append(title)
-            new_vae.append(v_emb)
+            if use_vae:
+                new_vae.append(v_emb)
             new_clap.append(c_emb)
         else:
             failed.append(vid_id)
@@ -495,13 +512,26 @@ def cmd_embed(args):
     if existing_data is not None and len(existing_data["ids"]) > 0:
         all_ids = list(existing_data["ids"]) + new_ids
         all_titles = list(existing_data["titles"]) + new_titles
-        all_vae = np.concatenate([existing_data["vae"]] + ([np.stack(new_vae)] if new_vae else []))
+        if use_vae:
+            all_vae = np.concatenate([existing_data["vae"]] + ([np.stack(new_vae)] if new_vae else []))
+        else:
+            # Preserve existing VAE if present, or use zeros
+            if "vae" in existing_data and len(existing_data["vae"]) > 0:
+                # Pad with zeros for new entries
+                vae_dim = existing_data["vae"].shape[1]
+                new_zeros = np.zeros((len(new_ids), vae_dim), dtype=np.float32)
+                all_vae = np.concatenate([existing_data["vae"], new_zeros])
+            else:
+                all_vae = np.zeros((len(all_ids), 64), dtype=np.float32)
         all_clap = np.concatenate([existing_data["clap"]] + ([np.stack(new_clap)] if new_clap else []))
     else:
         all_ids = new_ids
         all_titles = new_titles
-        all_vae = np.stack(new_vae) if new_vae else np.array([])
-        all_clap = np.stack(new_clap) if new_clap else np.array([])
+        if use_vae:
+            all_vae = np.stack(new_vae) if new_vae else np.zeros((0, 64), dtype=np.float32)
+        else:
+            all_vae = np.zeros((len(new_ids), 64), dtype=np.float32)  # placeholder zeros
+        all_clap = np.stack(new_clap) if new_clap else np.zeros((0, 512), dtype=np.float32)
 
     # Save
     np.savez_compressed(
@@ -515,7 +545,10 @@ def cmd_embed(args):
     print(f"\nDone! Saved {len(all_ids)} embeddings to {emb_path}")
     if failed:
         print(f"Failed: {len(failed)} tracks")
-    print(f"  VAE dims:  {all_vae.shape if len(all_vae) else 'empty'}")
+    if use_vae:
+        print(f"  VAE dims:  {all_vae.shape if len(all_vae) else 'empty'}")
+    else:
+        print(f"  VAE dims:  CLAP-only mode (zeros placeholder)")
     print(f"  CLAP dims: {all_clap.shape if len(all_clap) else 'empty'}")
 
 
@@ -538,13 +571,17 @@ def cmd_similar(args):
     else:
         query_title = args.video_id
 
-    print(f"Similar to: {query_title}")
+    # Handle Unicode for Windows console
+    safe_title = query_title.encode('ascii', 'replace').decode('ascii')
+    print(f"Similar to: {safe_title}")
     print(f"  (alpha={args.alpha}: {args.alpha:.0%} semantic + {1-args.alpha:.0%} acoustic)\n")
 
     for i, r in enumerate(results, 1):
         src = f" [{r.get('source', 'library')}]" if r.get("source") == "discovery" else ""
         artist = f" by {r['artist']}" if r.get("artist") else ""
-        print(f"  {i:2d}. [{r['score']:.3f}] {r['title'][:60]}{artist}{src}")
+        safe_result = r['title'][:60].encode('ascii', 'replace').decode('ascii')
+        safe_artist = artist.encode('ascii', 'replace').decode('ascii')
+        print(f"  {i:2d}. [{r['score']:.3f}] {safe_result}{safe_artist}{src}")
         print(f"      CLAP={r['clap_score']:.3f}  VAE={r['vae_score']:.3f}  id={r['id']}")
 
 
@@ -560,7 +597,8 @@ def cmd_search(args):
 
     print(f'Search: "{args.query}"\n')
     for i, r in enumerate(results, 1):
-        print(f"  {i:2d}. [{r['score']:.3f}] {r['title'][:70]}")
+        safe_title = r['title'][:70].encode('ascii', 'replace').decode('ascii')
+        print(f"  {i:2d}. [{r['score']:.3f}] {safe_title}")
         print(f"      id={r['id']}")
 
 
@@ -777,6 +815,8 @@ def main():
 
     # embed
     p_embed = sub.add_parser("embed", help="Batch-encode all audio files")
+    p_embed.add_argument("--clap-only", action="store_true",
+                         help="Use CLAP embeddings only (skip VAE even if available)")
 
     # similar
     p_sim = sub.add_parser("similar", help="Find similar tracks")
