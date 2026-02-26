@@ -84,7 +84,7 @@ Return ONLY a JSON array with this exact format, no other text:
 Focus on finding high-quality music videos, official uploads, or well-known covers."""
 
         response = client.models.generate_content(
-            model="gemini-2.0-flash",
+            model="gemini-3.1-pro-preview",
             contents=prompt,
             config=types.GenerateContentConfig(
                 tools=[types.Tool(google_search=types.GoogleSearch())],
