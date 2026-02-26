@@ -100,17 +100,18 @@ No explanation, just the search terms. Examples:
         return raw_input
 
 
-def search_youtube_via_gemini(query: str, num_results: int = 8, optimize: bool = True) -> tuple[list[dict], str]:
+def search_youtube_via_gemini(query: str, num_results: int = 8, optimize: bool = True) -> tuple[list[dict], str, str]:
     """
     Use Gemini with Google Search to find YouTube music videos.
-    Returns tuple of (results, error_message).
+    Returns tuple of (results, error_message, optimized_query).
     results is list of {id, title, channel, description}.
     """
     client = get_gemini_client()
     if not client:
-        return [], "Gemini API not configured"
+        return [], "Gemini API not configured", query
 
     # Optimize the query first
+    original_query = query
     if optimize:
         query = optimize_music_query(query)
 
@@ -163,16 +164,16 @@ Focus on finding high-quality music videos, official uploads, or well-known cove
                             'description': r.get('description', ''),
                             'source': 'youtube'
                         })
-            return valid_results[:num_results], ""
-        return [], "No results found"
+            return valid_results[:num_results], "", query
+        return [], "No results found", query
     except Exception as e:
         error_str = str(e)
         if "PERMISSION_DENIED" in error_str or "leaked" in error_str.lower():
-            return [], "API key issue - please update .env"
+            return [], "API key issue - please update .env", query
         elif "RESOURCE_EXHAUSTED" in error_str or "quota" in error_str.lower():
-            return [], "API quota exceeded - try again later"
+            return [], "API quota exceeded - try again later", query
         print(f"Gemini search error: {e}")
-        return [], f"Search failed: {str(e)[:50]}"
+        return [], f"Search failed: {str(e)[:50]}", query
 
 from playlist_dl import (
     PLAYLIST_URL,
@@ -206,6 +207,31 @@ def save_failed(output_dir: Path, failed: set[str]):
     """Save the set of failed video IDs to disk."""
     fpath = output_dir / FAILED_FILE_NAME
     fpath.write_text(json.dumps(list(failed), indent=2))
+
+
+FEEDBACK_FILE_NAME = "user_feedback.json"
+
+def load_feedback(output_dir: Path) -> list[dict]:
+    """Load user feedback data from disk."""
+    fpath = output_dir / FEEDBACK_FILE_NAME
+    if fpath.exists():
+        try:
+            return json.loads(fpath.read_text())
+        except Exception:
+            return []
+    return []
+
+
+def save_feedback(output_dir: Path, entry: dict):
+    """Append a feedback entry to the feedback file."""
+    fpath = output_dir / FEEDBACK_FILE_NAME
+    feedback = load_feedback(output_dir)
+    feedback.append(entry)
+    # Keep last 10000 entries to prevent unbounded growth
+    if len(feedback) > 10000:
+        feedback = feedback[-10000:]
+    fpath.write_text(json.dumps(feedback, indent=2))
+
 
 try:
     import numpy as np
@@ -481,6 +507,8 @@ class Handler(BaseHTTPRequestHandler):
             self._api_clear_failed()
         elif self.path.startswith("/api/open-folder"):
             self._api_open_folder()
+        elif self.path == "/api/feedback":
+            self._api_feedback()
         else:
             self.send_error(404)
 
@@ -637,6 +665,33 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._json_response({"error": str(exc)}, 500)
 
+    def _api_feedback(self):
+        """Log user feedback for YouTube suggestions (plays, thumbs up)."""
+        body = self._read_json_body()
+        action = body.get("action")  # "play" or "thumbup"
+        yt_id = body.get("yt_id")  # YouTube video ID
+        yt_title = body.get("yt_title", "")
+        query_id = body.get("query_id", "")  # Original track that triggered search
+        query_title = body.get("query_title", "")
+        optimized_query = body.get("optimized_query", "")
+
+        if not action or not yt_id:
+            self._json_response({"error": "Missing action or yt_id"}, 400)
+            return
+
+        entry = {
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "action": action,
+            "yt_id": yt_id,
+            "yt_title": yt_title,
+            "query_id": query_id,
+            "query_title": query_title,
+            "optimized_query": optimized_query,
+        }
+        save_feedback(app_state["output_dir"], entry)
+        print(f"Feedback logged: {action} on '{yt_title}' (from query: '{query_title}')")
+        self._json_response({"ok": True})
+
     def _api_similar(self, video_id: str, qs: str):
         """Return top-N similar tracks by blended embedding similarity."""
         if not _HAS_RECOMMENDER:
@@ -788,8 +843,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json_response({"query": query, "results": [], "message": "Gemini API key not configured"})
             return
 
-        results, error_msg = search_youtube_via_gemini(query, num_results=n)
-        response = {"query": query, "results": results}
+        results, error_msg, optimized_query = search_youtube_via_gemini(query, num_results=n)
+        response = {"query": query, "results": results, "optimized_query": optimized_query}
         if error_msg:
             response["message"] = error_msg
         self._json_response(response)
@@ -2808,6 +2863,9 @@ input[type="checkbox"] {
     } catch(e) {}
   }
 
+  // Track current search context for feedback
+  let currentSearchContext = { queryId: '', queryTitle: '', optimizedQuery: '' };
+
   async function fetchSimilar(videoId) {
     showModal('Finding similar tracks...', true);
     const modal = document.querySelector('.modal');
@@ -2821,8 +2879,11 @@ input[type="checkbox"] {
       const track = allTracks.find(t => t.id === videoId);
       const queryTitle = track ? track.title : videoId;
 
-      // Start YouTube search in parallel
-      const ytPromise = fetch(`/api/youtube-search?q=${encodeURIComponent(queryTitle)}&n=10`)
+      // Store context for feedback
+      currentSearchContext = { queryId: videoId, queryTitle: queryTitle, optimizedQuery: '' };
+
+      // Start YouTube search in parallel (limited to 5 results)
+      const ytPromise = fetch(`/api/youtube-search?q=${encodeURIComponent(queryTitle)}&n=5`)
         .then(r => r.json())
         .catch(() => ({ results: [] }));
 
@@ -2831,6 +2892,11 @@ input[type="checkbox"] {
       if (localData.error) {
         showModalError(localData.error);
         return;
+      }
+
+      // Store the optimized query if available
+      if (ytData.optimized_query) {
+        currentSearchContext.optimizedQuery = ytData.optimized_query;
       }
 
       // Calculate if we need YouTube suggestions (avg score < 50%)
@@ -2849,6 +2915,23 @@ input[type="checkbox"] {
     } catch(e) {
       showModalError('Failed to fetch: ' + e.message);
     }
+  }
+
+  async function logFeedback(action, ytId, ytTitle) {
+    try {
+      await fetch('/api/feedback', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          action: action,
+          yt_id: ytId,
+          yt_title: ytTitle,
+          query_id: currentSearchContext.queryId,
+          query_title: currentSearchContext.queryTitle,
+          optimized_query: currentSearchContext.optimizedQuery,
+        })
+      });
+    } catch(e) { console.error('Feedback log failed:', e); }
   }
 
   async function doSemanticSearch(query) {
@@ -2948,12 +3031,14 @@ input[type="checkbox"] {
         const r = ytResults[i];
         const channel = r.channel ? ` <span style="color:var(--text2);font-size:0.75rem">- ${escHtml(r.channel)}</span>` : '';
         const isAlreadyDownloaded = allTracks.some(t => t.id === r.id && t.status === 'downloaded');
+        const titleAttr = escHtml(r.title).replace(/"/g, '&quot;');
         let actionBtns = '';
         if (isAlreadyDownloaded) {
           actionBtns += `<button data-mplay="${r.id}" title="Play (already downloaded)">&#9654;</button>`;
         } else {
-          actionBtns += `<button data-myt="${r.id}" title="Listen on YouTube">&#127911;</button>`;
+          actionBtns += `<button data-ytplay="${r.id}" data-yttitle="${titleAttr}" title="Listen on YouTube">&#127911;</button>`;
         }
+        actionBtns += `<button data-ytlike="${r.id}" data-yttitle="${titleAttr}" title="Thumbs up - this is a good match!" style="color:var(--neon-green)">&#128077;</button>`;
         ytHtml += `<div class="sim-result">` +
           `<span class="sim-rank" style="color:var(--red)">${i + 1}.</span>` +
           `<span class="sim-title" title="${escHtml(r.title)}" style="flex:1">${escHtml(r.title)}${channel}</span>` +
@@ -3007,6 +3092,26 @@ input[type="checkbox"] {
     const ytBtn = e.target.closest('[data-myt]');
     if (ytBtn) {
       window.open(`https://www.youtube.com/watch?v=${ytBtn.dataset.myt}`, '_blank');
+      return;
+    }
+    // YouTube play button with feedback logging
+    const ytPlayBtn = e.target.closest('[data-ytplay]');
+    if (ytPlayBtn) {
+      const ytId = ytPlayBtn.dataset.ytplay;
+      const ytTitle = ytPlayBtn.dataset.yttitle || '';
+      logFeedback('play', ytId, ytTitle);
+      window.open(`https://www.youtube.com/watch?v=${ytId}`, '_blank');
+      return;
+    }
+    // YouTube thumbs up button
+    const ytLikeBtn = e.target.closest('[data-ytlike]');
+    if (ytLikeBtn) {
+      const ytId = ytLikeBtn.dataset.ytlike;
+      const ytTitle = ytLikeBtn.dataset.yttitle || '';
+      logFeedback('thumbup', ytId, ytTitle);
+      ytLikeBtn.textContent = '\u2705'; // checkmark
+      ytLikeBtn.style.color = 'var(--neon-green)';
+      ytLikeBtn.disabled = true;
       return;
     }
     const simBtn = e.target.closest('[data-msim]');
