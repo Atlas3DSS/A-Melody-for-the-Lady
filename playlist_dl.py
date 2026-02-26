@@ -25,15 +25,30 @@ def _get_default_output_dir():
     wsl_windows_path = Path("/mnt/c/Users")
     if wsl_windows_path.exists():
         # In WSL - try to find the Windows user's Music folder
-        for user_dir in wsl_windows_path.iterdir():
-            music_dir = user_dir / "Music" / "playlist_download"
-            if music_dir.exists():
-                return music_dir
-        # Fallback: use the first user with a Music folder
-        for user_dir in wsl_windows_path.iterdir():
-            music_dir = user_dir / "Music"
-            if music_dir.exists():
-                return music_dir / "playlist_download"
+        # Skip system/service accounts
+        skip_users = {'defaultuser100000', 'Default', 'Public', 'Default User', 'All Users'}
+        try:
+            for user_dir in wsl_windows_path.iterdir():
+                if user_dir.name in skip_users:
+                    continue
+                try:
+                    music_dir = user_dir / "Music" / "playlist_download"
+                    if music_dir.exists():
+                        return music_dir
+                except PermissionError:
+                    continue
+            # Fallback: use the first user with a Music folder
+            for user_dir in wsl_windows_path.iterdir():
+                if user_dir.name in skip_users:
+                    continue
+                try:
+                    music_dir = user_dir / "Music"
+                    if music_dir.exists():
+                        return music_dir / "playlist_download"
+                except PermissionError:
+                    continue
+        except PermissionError:
+            pass
     # Default to user's home Music folder
     return Path.home() / "Music" / "playlist_download"
 
