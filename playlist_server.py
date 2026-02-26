@@ -1772,6 +1772,7 @@ input[type="checkbox"] {
       <button class="btn sm" id="btn-sel-none" title="Deselect all">None</button>
       <button class="btn sm" id="btn-sel-invert" title="Invert selection">Invert</button>
     </div>
+    <button class="btn sm" id="btn-queue-all" title="Add entire library to playlist (shuffle)" style="background:var(--neon-green);color:#000">&#9654; Queue All</button>
     <button class="btn primary" id="btn-download">Download Selected</button>
     <button class="btn danger" id="btn-cancel" style="display:none">Cancel</button>
     <button class="btn sm" id="btn-clear-failed" title="Reset failed tracks to pending so they can be retried">Clear Failed</button>
@@ -2145,6 +2146,30 @@ input[type="checkbox"] {
   $('btn-sel-invert').addEventListener('click', () => {
     visibleTracks().forEach(t => { selected.has(t.id) ? selected.delete(t.id) : selected.add(t.id); });
     renderTable();
+  });
+
+  // Queue entire library (shuffled)
+  $('btn-queue-all').addEventListener('click', () => {
+    const downloaded = allTracks.filter(t => t.status === 'downloaded');
+    if (downloaded.length === 0) {
+      alert('No downloaded tracks to queue!');
+      return;
+    }
+    // Shuffle using Fisher-Yates
+    const shuffled = [...downloaded];
+    for (let i = shuffled.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+    }
+    // Clear existing queue and add all
+    player.queue = [];
+    shuffled.forEach(t => player.addToQueue(t));
+    // Start playing if not already
+    if (!player.current) {
+      player.playNext();
+    }
+    $('btn-queue-all').textContent = `\u2713 ${shuffled.length} queued`;
+    setTimeout(() => { $('btn-queue-all').innerHTML = '&#9654; Queue All'; }, 2000);
   });
 
   document.querySelectorAll('.pill').forEach(btn => {
