@@ -88,11 +88,35 @@ python3 playlist_dl.py [options]
 4. Each track gets: `.opus` audio, `.info.json` metadata, thumbnail, description, subtitles
 5. The web UI streams audio directly from the download directory with HTTP Range support
 
+## Pre-computed Embeddings
+
+Don't have a GPU? Download pre-computed CLAP embeddings from HuggingFace:
+
+**[orwelian84/arc-music-embeddings](https://huggingface.co/datasets/orwelian84/arc-music-embeddings)**
+
+| File | Size | Description |
+|------|------|-------------|
+| `embeddings.npz` | 3.5MB | Track-level embeddings (mean pooled) |
+| `segment_embeddings.npz` | 201MB | Full segment-level embeddings |
+
+These power the smart shuffle modes (Flow, Anti-cluster) and semantic search without needing to run inference locally.
+
+```python
+from huggingface_hub import hf_hub_download
+import numpy as np
+
+# Download and load
+emb_path = hf_hub_download("orwelian84/arc-music-embeddings", "embeddings.npz", repo_type="dataset")
+data = np.load(emb_path, allow_pickle=True)
+embeddings = data['clap']  # (1836, 512)
+```
+
 ## Tech Stack
 
 - **Python stdlib** — `http.server`, `threading`, `json` (zero web framework dependencies)
 - **yt-dlp** — audio extraction and metadata
 - **mutagen** — metadata embedding
+- **CLAP** — `laion/larger_clap_music` for semantic audio embeddings
 - **Web Audio API** — spectrum visualizer
 - **Server-Sent Events** — real-time download progress
 - **Single-page HTML** — everything embedded in one Python file, no build step
