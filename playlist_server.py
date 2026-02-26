@@ -491,6 +491,8 @@ class Handler(BaseHTTPRequestHandler):
             self._api_duplicates(qs)
         elif path == "/api/youtube-search":
             self._api_youtube_search(qs)
+        elif path == "/api/smart-shuffle":
+            self._api_smart_shuffle(qs)
         else:
             self.send_error(404)
 
@@ -849,6 +851,121 @@ class Handler(BaseHTTPRequestHandler):
             response["message"] = error_msg
         self._json_response(response)
 
+    def _api_smart_shuffle(self, qs: str):
+        """Return track IDs in smart shuffle order."""
+        params = parse_qs(qs)
+        mode = params.get("mode", ["random"])[0]
+        track_ids = params.get("ids", [""])[0].split(",")
+        track_ids = [tid for tid in track_ids if tid]  # Filter empty
+
+        if not track_ids:
+            self._json_response({"error": "No track IDs provided"}, 400)
+            return
+
+        if mode == "random":
+            # Fisher-Yates shuffle
+            import random
+            shuffled = track_ids[:]
+            for i in range(len(shuffled) - 1, 0, -1):
+                j = random.randint(0, i)
+                shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
+            self._json_response({"order": shuffled, "mode": mode})
+            return
+
+        if not _HAS_RECOMMENDER:
+            # Fall back to random if no recommender
+            import random
+            shuffled = track_ids[:]
+            random.shuffle(shuffled)
+            self._json_response({"order": shuffled, "mode": "random", "message": "Embeddings not available, using random"})
+            return
+
+        emb_data = get_embeddings()
+        if not emb_data:
+            import random
+            shuffled = track_ids[:]
+            random.shuffle(shuffled)
+            self._json_response({"order": shuffled, "mode": "random", "message": "Embeddings not loaded, using random"})
+            return
+
+        # Get embeddings for requested tracks
+        ids = emb_data["ids"]
+        clap = emb_data["clap"]
+
+        # Build index mapping
+        id_to_idx = {vid: i for i, vid in enumerate(ids)}
+        valid_ids = [tid for tid in track_ids if tid in id_to_idx]
+
+        if len(valid_ids) < 2:
+            self._json_response({"order": track_ids, "mode": mode, "message": "Not enough embedded tracks"})
+            return
+
+        valid_embs = np.stack([clap[id_to_idx[tid]] for tid in valid_ids])
+
+        if mode == "flow":
+            # Start from random, always pick most similar unplayed track
+            import random
+            remaining = set(range(len(valid_ids)))
+            start = random.choice(list(remaining))
+            remaining.remove(start)
+            order = [start]
+
+            # Precompute similarity matrix
+            norms = np.linalg.norm(valid_embs, axis=1, keepdims=True)
+            normed = valid_embs / (norms + 1e-8)
+            sim_matrix = normed @ normed.T
+
+            while remaining:
+                current = order[-1]
+                # Find most similar among remaining
+                best_idx = None
+                best_sim = -1
+                for idx in remaining:
+                    if sim_matrix[current, idx] > best_sim:
+                        best_sim = sim_matrix[current, idx]
+                        best_idx = idx
+                order.append(best_idx)
+                remaining.remove(best_idx)
+
+            shuffled = [valid_ids[i] for i in order]
+
+        elif mode == "anticluster":
+            # Start from random, always pick LEAST similar to recent tracks
+            import random
+            remaining = set(range(len(valid_ids)))
+            start = random.choice(list(remaining))
+            remaining.remove(start)
+            order = [start]
+
+            # Precompute similarity matrix
+            norms = np.linalg.norm(valid_embs, axis=1, keepdims=True)
+            normed = valid_embs / (norms + 1e-8)
+            sim_matrix = normed @ normed.T
+
+            while remaining:
+                # Average similarity to last 3 tracks
+                recent = order[-3:] if len(order) >= 3 else order
+                best_idx = None
+                best_dissim = -1
+                for idx in remaining:
+                    avg_sim = sum(sim_matrix[r, idx] for r in recent) / len(recent)
+                    dissim = 1 - avg_sim
+                    if dissim > best_dissim:
+                        best_dissim = dissim
+                        best_idx = idx
+                order.append(best_idx)
+                remaining.remove(best_idx)
+
+            shuffled = [valid_ids[i] for i in order]
+
+        else:
+            # Unknown mode, fall back to random
+            import random
+            shuffled = valid_ids[:]
+            random.shuffle(shuffled)
+
+        self._json_response({"order": shuffled, "mode": mode})
+
     def _api_audio(self, video_id: str):
         """Serve audio file with HTTP Range support for seeking."""
         fpath = find_audio_file(video_id)
@@ -1137,6 +1254,24 @@ input[type="text"]::placeholder { color: var(--text2); }
 .btn.neon-cyan:hover { box-shadow: var(--glow-cyan); background: var(--blue-dim); }
 .btn.sm { padding: 0.3rem 0.6rem; font-size: 0.8rem; }
 .btn-group { display: flex; gap: 0.35rem; }
+
+.shuffle-dropdown { position: relative; display: inline-block; }
+.shuffle-menu {
+  display: none; position: absolute; top: 100%; left: 0; z-index: 100;
+  background: var(--bg2); border: 1px solid var(--border); border-radius: 8px;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.4); min-width: 200px; margin-top: 4px;
+}
+.shuffle-dropdown.open .shuffle-menu { display: block; }
+.shuffle-menu button {
+  display: block; width: 100%; padding: 0.6rem 1rem; text-align: left;
+  background: transparent; border: none; color: var(--text); cursor: pointer;
+  font-size: 0.85rem; transition: background 0.15s;
+}
+.shuffle-menu button:hover:not(:disabled) { background: var(--bg3); }
+.shuffle-menu button.active { color: var(--neon-green); font-weight: 600; }
+.shuffle-menu button:disabled { color: var(--text2); cursor: not-allowed; opacity: 0.5; }
+.shuffle-menu button:first-child { border-radius: 8px 8px 0 0; }
+.shuffle-menu button:last-child { border-radius: 0 0 8px 8px; }
 
 .filters { display: flex; gap: 0.35rem; flex-wrap: wrap; }
 .pill {
@@ -1772,7 +1907,15 @@ input[type="checkbox"] {
       <button class="btn sm" id="btn-sel-none" title="Deselect all">None</button>
       <button class="btn sm" id="btn-sel-invert" title="Invert selection">Invert</button>
     </div>
-    <button class="btn sm" id="btn-queue-all" title="Add entire library to playlist (shuffle)" style="background:var(--neon-green);color:#000">&#9654; Queue All</button>
+    <div class="shuffle-dropdown" id="shuffle-dropdown">
+      <button class="btn sm" id="btn-queue-all" title="Add entire library to playlist" style="background:var(--neon-green);color:#000">&#9654; Queue All &#9662;</button>
+      <div class="shuffle-menu" id="shuffle-menu">
+        <button data-shuffle="random" class="active">Random</button>
+        <button data-shuffle="flow">Flow (smooth transitions)</button>
+        <button data-shuffle="anticluster">Anti-cluster (variety)</button>
+        <button data-shuffle="dj" disabled title="Needs segment embeddings">DJ Mode (coming soon)</button>
+      </div>
+    </div>
     <button class="btn primary" id="btn-download">Download Selected</button>
     <button class="btn danger" id="btn-cancel" style="display:none">Cancel</button>
     <button class="btn sm" id="btn-clear-failed" title="Reset failed tracks to pending so they can be retried">Clear Failed</button>
@@ -2148,29 +2291,93 @@ input[type="checkbox"] {
     renderTable();
   });
 
-  // Queue entire library (shuffled)
-  $('btn-queue-all').addEventListener('click', () => {
+  // Smart shuffle dropdown
+  let shuffleMode = 'random';
+  const shuffleDropdown = $('shuffle-dropdown');
+  const shuffleMenu = $('shuffle-menu');
+  const btnQueueAll = $('btn-queue-all');
+
+  // Toggle dropdown on button click
+  btnQueueAll.addEventListener('click', (e) => {
+    e.stopPropagation();
+    shuffleDropdown.classList.toggle('open');
+  });
+
+  // Close dropdown when clicking outside
+  document.addEventListener('click', (e) => {
+    if (!shuffleDropdown.contains(e.target)) {
+      shuffleDropdown.classList.remove('open');
+    }
+  });
+
+  // Handle shuffle mode selection
+  shuffleMenu.querySelectorAll('button').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      if (btn.disabled) return;
+
+      const mode = btn.dataset.shuffle;
+      shuffleMode = mode;
+
+      // Update active state
+      shuffleMenu.querySelectorAll('button').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+
+      // Close menu and queue tracks
+      shuffleDropdown.classList.remove('open');
+      await queueAllWithShuffle(mode);
+    });
+  });
+
+  async function queueAllWithShuffle(mode) {
     const downloaded = allTracks.filter(t => t.status === 'downloaded');
     if (downloaded.length === 0) {
       alert('No downloaded tracks to queue!');
       return;
     }
-    // Shuffle using Fisher-Yates
-    const shuffled = [...downloaded];
-    for (let i = shuffled.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+
+    const ids = downloaded.map(t => t.id);
+    btnQueueAll.disabled = true;
+    btnQueueAll.innerHTML = '&#8987; Shuffling...';
+
+    try {
+      const resp = await fetch(`/api/smart-shuffle?mode=${mode}&ids=${ids.join(',')}`);
+      const data = await resp.json();
+
+      if (data.error) {
+        alert(data.error);
+        return;
+      }
+
+      // Create track map for quick lookup
+      const trackMap = Object.fromEntries(downloaded.map(t => [t.id, t]));
+
+      // Queue tracks in returned order
+      player.queue = [];
+      data.order.forEach(id => {
+        if (trackMap[id]) {
+          player.addToQueue(trackMap[id]);
+        }
+      });
+
+      // Start playing if not already
+      if (!player.current) {
+        player.playNext();
+      }
+
+      const modeNames = {random: 'Random', flow: 'Flow', anticluster: 'Variety'};
+      btnQueueAll.innerHTML = `&#10003; ${data.order.length} (${modeNames[data.mode] || data.mode})`;
+      if (data.message) console.log('Shuffle:', data.message);
+    } catch (err) {
+      console.error('Shuffle error:', err);
+      alert('Shuffle failed: ' + err.message);
+    } finally {
+      setTimeout(() => {
+        btnQueueAll.disabled = false;
+        btnQueueAll.innerHTML = '&#9654; Queue All &#9662;';
+      }, 2000);
     }
-    // Clear existing queue and add all
-    player.queue = [];
-    shuffled.forEach(t => player.addToQueue(t));
-    // Start playing if not already
-    if (!player.current) {
-      player.playNext();
-    }
-    $('btn-queue-all').textContent = `\u2713 ${shuffled.length} queued`;
-    setTimeout(() => { $('btn-queue-all').innerHTML = '&#9654; Queue All'; }, 2000);
-  });
+  }
 
   document.querySelectorAll('.pill').forEach(btn => {
     btn.addEventListener('click', () => {
