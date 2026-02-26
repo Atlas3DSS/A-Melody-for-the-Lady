@@ -13,12 +13,15 @@ import os
 import random
 import argparse
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
-PLAYLIST_URL = "https://www.youtube.com/playlist?list=PLuDePDS-QMFF5yrciQc5qwbWOTvPutJW5"
+PLAYLIST_URL = ""  # Set via --url or environment
 DEFAULT_OUTPUT_DIR = Path.home() / "Music" / "playlist_download"
 BATCH_SIZE = 25
-PAUSE_BETWEEN_BATCHES = (30, 60)  # random sleep range in seconds
-PAUSE_BETWEEN_TRACKS = (2, 5)
+CONCURRENT_DOWNLOADS = 4  # parallel downloads per batch
+PAUSE_BETWEEN_TRACKS = (1, 3)  # random sleep range between tracks in a batch
+PAUSE_BETWEEN_BATCHES = (8, 15)  # random sleep range in seconds (max 15)
 MAX_RETRIES = 3
 PROGRESS_FILE_NAME = ".download_progress.json"
 
@@ -74,8 +77,29 @@ def save_progress(output_dir: Path, completed: set[str]):
     }, indent=2))
 
 
-def download_track(video_id: str, output_dir: Path) -> bool:
-    """Download a single track with full metadata and lyrics."""
+# Error patterns that indicate video is unavailable (no point retrying)
+UNAVAILABLE_PATTERNS = [
+    "Private video",
+    "Video unavailable",
+    "This video has been removed",
+    "This video is no longer available",
+    "This video is private",
+    "removed by the uploader",
+    "account associated with this video has been terminated",
+    "no longer available due to a copyright claim",
+    "blocked it in your country",
+    "age-restricted",
+    "Sign in to confirm your age",
+    "Join this channel to get access",
+    "members-only content",
+]
+
+
+def download_track(video_id: str, output_dir: Path) -> tuple[bool, bool]:
+    """Download a single track with full metadata and lyrics.
+
+    Returns: (success, is_unavailable) - is_unavailable=True means no point retrying
+    """
     video_url = f"https://www.youtube.com/watch?v={video_id}"
 
     cmd = [
@@ -128,18 +152,23 @@ def download_track(video_id: str, output_dir: Path) -> bool:
     # downloaded fine (e.g. subtitle fetch failed). Check if the audio
     # file actually landed on disk.
     if result.returncode == 0:
-        return True
+        return (True, False)
 
     # Check if an audio file was actually written despite the error
     tag = f"[{video_id}]"
     for f in output_dir.iterdir():
         if tag in f.name and f.suffix in (".opus", ".m4a", ".mp3", ".ogg", ".webm"):
-            return True
+            return (True, False)
 
     err = result.stderr.strip()
+    combined_output = result.stdout + result.stderr
+
+    # Check if this is an unavailable video (don't retry these)
+    is_unavailable = any(pattern.lower() in combined_output.lower() for pattern in UNAVAILABLE_PATTERNS)
+
     if err:
         print(f"    yt-dlp stderr: {err[:300]}")
-    return False
+    return (False, is_unavailable)
 
 
 def main():
@@ -148,6 +177,8 @@ def main():
                         help=f"Output directory (default: {DEFAULT_OUTPUT_DIR})")
     parser.add_argument("-b", "--batch-size", type=int, default=BATCH_SIZE,
                         help=f"Tracks per batch (default: {BATCH_SIZE})")
+    parser.add_argument("-c", "--concurrent", type=int, default=CONCURRENT_DOWNLOADS,
+                        help=f"Concurrent downloads (default: {CONCURRENT_DOWNLOADS})")
     parser.add_argument("--start-from", type=int, default=0,
                         help="Skip the first N tracks in the playlist (0-indexed)")
     parser.add_argument("--url", type=str, default=PLAYLIST_URL,
@@ -172,7 +203,8 @@ def main():
 
     print(f"Already downloaded: {len(completed)}")
     print(f"Remaining: {len(remaining)}")
-    print(f"Batch size: {args.batch_size}\n")
+    print(f"Batch size: {args.batch_size}")
+    print(f"Concurrent downloads: {args.concurrent}\n")
 
     if args.dry_run:
         for i, entry in enumerate(remaining[:50], 1):
@@ -181,9 +213,34 @@ def main():
             print(f"  ... and {len(remaining) - 50} more")
         return
 
-    # Process in batches
+    # Process in batches with concurrent downloads
     total_batches = (len(remaining) + args.batch_size - 1) // args.batch_size
     failed = []
+    progress_lock = threading.Lock()
+
+    def download_with_retry(entry, batch_idx, batch_size):
+        """Download a track with retries, returns (entry, success)."""
+        vid_id = entry["id"]
+        title = entry["title"]
+        print(f"  [Starting] {title[:50]}...")
+
+        for attempt in range(1, MAX_RETRIES + 1):
+            if attempt > 1:
+                wait = 10 * attempt
+                print(f"    [{vid_id}] Retry {attempt}/{MAX_RETRIES} in {wait}s...")
+                time.sleep(wait)
+
+            success, is_unavailable = download_track(vid_id, output_dir)
+            if success:
+                print(f"  [Done] {title[:50]}")
+                return (entry, True)
+
+            if is_unavailable:
+                print(f"  [UNAVAILABLE] {title[:50]} - skipping retries")
+                return (entry, False)
+
+        print(f"  [FAILED] {title[:50]} after {MAX_RETRIES} attempts")
+        return (entry, False)
 
     for batch_num in range(total_batches):
         batch_start = batch_num * args.batch_size
@@ -195,40 +252,32 @@ def main():
               f"(tracks {batch_start + 1}-{batch_end} of {len(remaining)})")
         print(f"{'='*60}\n")
 
-        for i, entry in enumerate(batch, 1):
-            vid_id = entry["id"]
-            title = entry["title"]
-            global_idx = len(completed) + 1
-            print(f"  [{i}/{len(batch)}] (#{global_idx} overall) {title}")
+        batch_completed = 0
+        batch_failed = 0
 
-            success = False
-            for attempt in range(1, MAX_RETRIES + 1):
-                if attempt > 1:
-                    wait = 10 * attempt
-                    print(f"    Retry {attempt}/{MAX_RETRIES} in {wait}s...")
-                    time.sleep(wait)
+        with ThreadPoolExecutor(max_workers=args.concurrent) as executor:
+            futures = {
+                executor.submit(download_with_retry, entry, i, len(batch)): entry
+                for i, entry in enumerate(batch, 1)
+            }
 
-                if download_track(vid_id, output_dir):
-                    success = True
-                    break
+            for future in as_completed(futures):
+                entry, success = future.result()
+                with progress_lock:
+                    if success:
+                        batch_completed += 1
+                        completed.add(entry["id"])
+                        save_progress(output_dir, completed)
+                    else:
+                        batch_failed += 1
+                        failed.append(entry)
 
-            if success:
-                print(f"    Done.")
-                completed.add(vid_id)
-                save_progress(output_dir, completed)
-            else:
-                print(f"    FAILED after {MAX_RETRIES} attempts. Skipping.")
-                failed.append(entry)
-
-            # Small pause between individual tracks
-            if i < len(batch):
-                pause = random.uniform(*PAUSE_BETWEEN_TRACKS)
-                time.sleep(pause)
+        print(f"\n  Batch summary: {batch_completed} succeeded, {batch_failed} failed")
 
         # Pause between batches
         if batch_num < total_batches - 1:
             pause = random.uniform(*PAUSE_BETWEEN_BATCHES)
-            print(f"\nBatch complete. Pausing {pause:.0f}s before next batch...\n")
+            print(f"  Pausing {pause:.0f}s before next batch...\n")
             time.sleep(pause)
 
     # Summary

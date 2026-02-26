@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Web UI for the playlist downloader with built-in Winamp-style player.
-Run this and open http://localhost:8080 in your browser.
+Run this and open http://localhost:5050 in your browser.
 
 Usage:
     python playlist_server.py --no-browser
@@ -36,6 +36,26 @@ from playlist_dl import (
     download_track,
 )
 
+FAILED_FILE_NAME = ".failed_tracks.json"
+
+
+def load_failed(output_dir: Path) -> set[str]:
+    """Load the set of failed video IDs from disk."""
+    fpath = output_dir / FAILED_FILE_NAME
+    if fpath.exists():
+        try:
+            data = json.loads(fpath.read_text())
+            return set(data) if isinstance(data, list) else set()
+        except Exception:
+            return set()
+    return set()
+
+
+def save_failed(output_dir: Path, failed: set[str]):
+    """Save the set of failed video IDs to disk."""
+    fpath = output_dir / FAILED_FILE_NAME
+    fpath.write_text(json.dumps(list(failed), indent=2))
+
 # ---------------------------------------------------------------------------
 # Global state
 # ---------------------------------------------------------------------------
@@ -47,6 +67,9 @@ app_state = {
     "downloading": False,
     "cancel_flag": False,
     "current_id": None,
+    "loading": False,  # True while fetching playlist from YouTube
+    "skip_loading": False,  # Flag to skip YouTube playlist loading
+    "playlist_url": PLAYLIST_URL,  # Current playlist URL
 }
 
 sse_clients: list[queue.Queue] = []
@@ -70,7 +93,9 @@ def download_worker(ids: list[str]):
     state = app_state
     state["downloading"] = True
     state["cancel_flag"] = False
+    # Clear failed status for tracks we're about to retry
     state["failed"] -= set(ids)
+    save_failed(state["output_dir"], state["failed"])
 
     total = len(ids)
     done_count = 0
@@ -111,20 +136,27 @@ def download_worker(ids: list[str]):
                 if attempt > 1:
                     broadcast_sse("retry", {"id": vid_id, "attempt": attempt})
                     time.sleep(10 * attempt)
-                if download_track(vid_id, state["output_dir"]):
+                ok, is_unavailable = download_track(vid_id, state["output_dir"])
+                if ok:
                     success = True
+                    break
+                if is_unavailable:
+                    # Video unavailable, no point retrying
                     break
 
             if success:
                 done_count += 1
                 state["completed"].add(vid_id)
+                state["failed"].discard(vid_id)  # Remove from failed if was there
                 save_progress(state["output_dir"], state["completed"])
+                save_failed(state["output_dir"], state["failed"])
                 broadcast_sse("track_done", {
                     "id": vid_id, "title": title,
                     "done": done_count, "total": total,
                 })
             else:
                 state["failed"].add(vid_id)
+                save_failed(state["output_dir"], state["failed"])
                 fail_list.append(vid_id)
                 broadcast_sse("track_fail", {"id": vid_id, "title": title})
 
@@ -158,6 +190,35 @@ def find_file_by_id(video_id: str, extensions: tuple[str, ...]) -> Path | None:
     return None
 
 
+def scan_downloaded_tracks() -> list[dict]:
+    """Scan output directory for downloaded audio files and return track entries."""
+    import re
+    output_dir = app_state["output_dir"]
+    audio_exts = (".mp3", ".opus", ".m4a", ".ogg", ".webm")
+    tracks = []
+    seen_ids = set()
+
+    # Pattern to extract video ID from filename: "Title [VIDEO_ID].ext"
+    id_pattern = re.compile(r'\[([a-zA-Z0-9_-]{11})\]')
+
+    for f in output_dir.iterdir():
+        if not f.is_file() or f.suffix.lower() not in audio_exts:
+            continue
+        match = id_pattern.search(f.stem)
+        if match:
+            vid_id = match.group(1)
+            if vid_id in seen_ids:
+                continue
+            seen_ids.add(vid_id)
+            # Extract title (everything before the [ID])
+            title = f.stem[:match.start()].strip()
+            if not title:
+                title = vid_id
+            tracks.append({"id": vid_id, "title": title})
+
+    return tracks
+
+
 def find_audio_file(video_id: str) -> Path | None:
     return find_file_by_id(video_id, ("mp3", "opus", "m4a", "ogg", "webm"))
 
@@ -187,6 +248,8 @@ class Handler(BaseHTTPRequestHandler):
         elif path.startswith("/api/audio/"):
             vid_id = path[len("/api/audio/"):]
             self._api_audio(vid_id)
+        elif path == "/api/config":
+            self._api_config()
         else:
             self.send_error(404)
 
@@ -197,6 +260,10 @@ class Handler(BaseHTTPRequestHandler):
             self._api_cancel()
         elif self.path == "/api/refresh":
             self._api_refresh()
+        elif self.path == "/api/skip-loading":
+            self._api_skip_loading()
+        elif self.path == "/api/clear-failed":
+            self._api_clear_failed()
         elif self.path.startswith("/api/open-folder"):
             self._api_open_folder()
         else:
@@ -214,28 +281,49 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         return json.loads(self.rfile.read(length)) if length else {}
 
+    def _api_config(self):
+        """Return current config including playlist URL."""
+        self._json_response({
+            "playlist_url": app_state["playlist_url"],
+        })
+
     def _api_tracks(self):
         state = app_state
         tracks = []
-        for i, e in enumerate(state["entries"]):
-            vid_id = e["id"]
-            if vid_id == state.get("current_id"):
-                status = "downloading"
-            elif vid_id in state["completed"]:
-                status = "downloaded"
-            elif vid_id in state["failed"]:
-                status = "failed"
-            else:
-                status = "pending"
-            tracks.append({
-                "index": i + 1, "id": vid_id,
-                "title": e["title"], "status": status,
-            })
+
+        # If playlist is loaded, use it; otherwise scan directory for downloaded files
+        if state["entries"]:
+            # Use full playlist
+            for i, e in enumerate(state["entries"]):
+                vid_id = e["id"]
+                if vid_id == state.get("current_id"):
+                    status = "downloading"
+                elif vid_id in state["completed"]:
+                    status = "downloaded"
+                elif vid_id in state["failed"]:
+                    status = "failed"
+                else:
+                    status = "pending"
+                tracks.append({
+                    "index": i + 1, "id": vid_id,
+                    "title": e["title"], "status": status,
+                })
+        else:
+            # Playlist not loaded yet - scan directory for downloaded tracks
+            scanned = scan_downloaded_tracks()
+            for i, e in enumerate(scanned):
+                vid_id = e["id"]
+                tracks.append({
+                    "index": i + 1, "id": vid_id,
+                    "title": e["title"], "status": "downloaded",
+                })
+
         self._json_response({
             "tracks": tracks, "total": len(tracks),
             "downloaded": len(state["completed"]),
             "failed": len(state["failed"]),
             "downloading": state["downloading"],
+            "loading": state.get("loading", False),
         })
 
     def _api_download(self):
@@ -259,13 +347,40 @@ class Handler(BaseHTTPRequestHandler):
         self._json_response({"ok": True})
 
     def _api_refresh(self):
-        try:
-            entries = get_playlist_entries(PLAYLIST_URL)
-            app_state["entries"] = entries
-            app_state["completed"] = load_progress(app_state["output_dir"])
-            self._json_response({"ok": True, "count": len(entries)})
-        except Exception as exc:
-            self._json_response({"error": str(exc)}, 500)
+        body = self._read_json_body()
+        url = body.get("url", app_state["playlist_url"])
+        if url:
+            app_state["playlist_url"] = url
+
+        def fetch_async():
+            app_state["loading"] = True
+            broadcast_sse("playlist_loading", {})
+            try:
+                entries = get_playlist_entries(url)
+                app_state["entries"] = entries
+                app_state["completed"] = load_progress(app_state["output_dir"])
+                app_state["loading"] = False
+                broadcast_sse("playlist_loaded", {"count": len(entries)})
+            except Exception as e:
+                app_state["loading"] = False
+                broadcast_sse("playlist_error", {"error": str(e)})
+
+        threading.Thread(target=fetch_async, daemon=True).start()
+        self._json_response({"ok": True, "message": "Fetching playlist..."})
+
+    def _api_skip_loading(self):
+        """Skip waiting for YouTube playlist and just use local files."""
+        app_state["skip_loading"] = True
+        app_state["loading"] = False
+        broadcast_sse("playlist_skipped", {})
+        self._json_response({"ok": True})
+
+    def _api_clear_failed(self):
+        """Clear all failed tracks so they can be retried."""
+        count = len(app_state["failed"])
+        app_state["failed"].clear()
+        save_failed(app_state["output_dir"], app_state["failed"])
+        self._json_response({"ok": True, "cleared": count})
 
     def _api_open_folder(self):
         """Open the download folder in the OS file manager, highlighting a file if given."""
@@ -1000,6 +1115,10 @@ input[type="checkbox"] {
   </header>
 
   <div class="controls">
+    <input type="text" id="playlist-url" placeholder="YouTube playlist URL..." style="flex: 2; min-width: 280px;">
+    <button class="btn primary" id="btn-load-playlist" title="Fetch playlist from YouTube">Load Playlist</button>
+  </div>
+  <div class="controls">
     <input type="text" id="search" placeholder="Search tracks...">
     <div class="filters">
       <button class="pill active" data-filter="all">All</button>
@@ -1014,7 +1133,7 @@ input[type="checkbox"] {
     </div>
     <button class="btn primary" id="btn-download">Download Selected</button>
     <button class="btn danger" id="btn-cancel" style="display:none">Cancel</button>
-    <button class="btn sm" id="btn-refresh" title="Re-fetch playlist from YouTube">Refresh</button>
+    <button class="btn sm" id="btn-clear-failed" title="Reset failed tracks to pending so they can be retried">Clear Failed</button>
   </div>
 
   <div class="progress-panel" id="progress-panel">
@@ -1044,7 +1163,8 @@ input[type="checkbox"] {
         <tbody id="tbody"></tbody>
       </table>
       <div class="loading" id="loading">
-        <div class="spinner"></div> Loading playlist...
+        <div class="spinner"></div> <span id="loading-text">Loading playlist...</span>
+        <button class="btn sm" id="btn-skip-loading" style="margin-left: 1rem; display: none;">Use Local Files</button>
       </div>
     </div>
   </div>
@@ -1142,20 +1262,100 @@ input[type="checkbox"] {
   const btnDownload = $('btn-download');
   const btnCancel = $('btn-cancel');
 
+  let isLoading = false;
+  const btnSkipLoading = $('btn-skip-loading');
+  const playlistUrlInput = $('playlist-url');
+  const btnLoadPlaylist = $('btn-load-playlist');
+
   async function fetchTracks() {
-    loading.style.display = 'flex';
-    tbody.innerHTML = '';
     try {
       const r = await fetch('/api/tracks');
       const data = await r.json();
       allTracks = data.tracks;
       downloading = data.downloading;
+      isLoading = data.loading;
       updateStats();
-      renderTable();
+
+      // Always render tracks if we have any (even while still loading from YouTube)
+      if (allTracks.length > 0) {
+        renderTable();
+        if (isLoading) {
+          // Show a note that we're still loading more, with skip button
+          loading.style.display = 'flex';
+          loading.querySelector('.spinner').style.display = '';
+          $('loading-text').textContent = 'Loading full playlist from YouTube...';
+          btnSkipLoading.style.display = '';
+        } else {
+          loading.style.display = 'none';
+          btnSkipLoading.style.display = 'none';
+        }
+      } else if (isLoading) {
+        // No tracks yet and still loading - show skip button
+        loading.style.display = 'flex';
+        loading.querySelector('.spinner').style.display = '';
+        $('loading-text').textContent = 'Fetching playlist from YouTube...';
+        btnSkipLoading.style.display = '';
+        tbody.innerHTML = '';
+      } else {
+        // Not loading and no tracks - empty state
+        loading.style.display = 'flex';
+        loading.querySelector('.spinner').style.display = 'none';
+        $('loading-text').textContent = 'No local tracks found. Enter a playlist URL and click "Load Playlist" to fetch from YouTube.';
+        $('loading-text').style.color = 'var(--text2)';
+        btnSkipLoading.style.display = 'none';
+        tbody.innerHTML = '';
+      }
     } catch(e) {
-      loading.innerHTML = '<span style="color:var(--red)">Failed to load tracks: ' + e.message + '</span>';
+      loading.querySelector('.spinner').style.display = 'none';
+      $('loading-text').textContent = 'Failed to load tracks: ' + e.message;
+      $('loading-text').style.color = 'var(--red)';
+      btnSkipLoading.style.display = 'none';
     }
   }
+
+  btnSkipLoading.addEventListener('click', async () => {
+    btnSkipLoading.disabled = true;
+    btnSkipLoading.textContent = 'Skipping...';
+    await fetch('/api/skip-loading', {method: 'POST'});
+    isLoading = false;
+    await fetchTracks();
+    btnSkipLoading.disabled = false;
+    btnSkipLoading.textContent = 'Use Local Files';
+  });
+
+  // Fetch config to populate playlist URL field
+  async function fetchConfig() {
+    try {
+      const r = await fetch('/api/config');
+      const data = await r.json();
+      playlistUrlInput.value = data.playlist_url || '';
+    } catch(e) {
+      console.error('Failed to fetch config:', e);
+    }
+  }
+
+  // Load Playlist button - fetch from YouTube
+  btnLoadPlaylist.addEventListener('click', async () => {
+    const url = playlistUrlInput.value.trim();
+    if (!url) {
+      alert('Please enter a playlist URL');
+      return;
+    }
+    btnLoadPlaylist.disabled = true;
+    btnLoadPlaylist.textContent = 'Loading...';
+    try {
+      await fetch('/api/refresh', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({url}),
+      });
+      // The SSE events will handle updating the UI
+    } catch(e) {
+      alert('Failed to start playlist fetch: ' + e.message);
+      btnLoadPlaylist.disabled = false;
+      btnLoadPlaylist.textContent = 'Load Playlist';
+    }
+  });
 
   function updateStats() {
     const done = allTracks.filter(t => t.status === 'downloaded').length;
@@ -1175,7 +1375,10 @@ input[type="checkbox"] {
   }
 
   function renderTable() {
-    loading.style.display = 'none';
+    // Only hide loading if playlist is fully loaded
+    if (!isLoading) {
+      loading.style.display = 'none';
+    }
     const tracks = visibleTracks();
     const fragments = [];
     for (const t of tracks) {
@@ -1316,11 +1519,20 @@ input[type="checkbox"] {
     await fetch('/api/cancel', {method: 'POST'});
   });
 
-  $('btn-refresh').addEventListener('click', async () => {
-    $('btn-refresh').disabled = true;
-    $('btn-refresh').textContent = 'Refreshing...';
-    try { await fetch('/api/refresh', {method: 'POST'}); await fetchTracks(); }
-    finally { $('btn-refresh').disabled = false; $('btn-refresh').textContent = 'Refresh'; }
+  $('btn-clear-failed').addEventListener('click', async () => {
+    const failedCount = allTracks.filter(t => t.status === 'failed').length;
+    if (failedCount === 0) { alert('No failed tracks to clear.'); return; }
+    if (!confirm(`Reset ${failedCount} failed track(s) to pending?`)) return;
+    $('btn-clear-failed').disabled = true;
+    try {
+      await fetch('/api/clear-failed', {method: 'POST'});
+      // Update local state
+      allTracks.forEach(t => { if (t.status === 'failed') t.status = 'pending'; });
+      renderTable();
+      updateStats();
+    } finally {
+      $('btn-clear-failed').disabled = false;
+    }
   });
 
   // SSE
@@ -1364,6 +1576,49 @@ input[type="checkbox"] {
       progressLabel.textContent = msg;
       logMsg(msg, d.failed > 0 ? 'warn' : 'ok');
       updateDownloadBtn(); updateStats();
+    });
+    es.addEventListener('playlist_loading', e => {
+      isLoading = true;
+      loading.style.display = 'flex';
+      loading.querySelector('.spinner').style.display = '';
+      $('loading-text').textContent = 'Fetching playlist from YouTube...';
+      $('loading-text').style.color = '';
+      btnSkipLoading.style.display = '';
+      btnLoadPlaylist.disabled = true;
+      btnLoadPlaylist.textContent = 'Loading...';
+    });
+    es.addEventListener('playlist_loaded', e => {
+      isLoading = false;
+      loading.style.display = 'none';
+      btnLoadPlaylist.disabled = false;
+      btnLoadPlaylist.textContent = 'Load Playlist';
+      fetchTracks();
+    });
+    es.addEventListener('playlist_error', e => {
+      isLoading = false;
+      const d = JSON.parse(e.data);
+      // If we have downloaded tracks, just show warning; otherwise show error
+      loading.querySelector('.spinner').style.display = 'none';
+      btnSkipLoading.style.display = 'none';
+      btnLoadPlaylist.disabled = false;
+      btnLoadPlaylist.textContent = 'Load Playlist';
+      if (allTracks.length > 0) {
+        $('loading-text').textContent = 'Could not fetch full playlist: ' + d.error;
+        $('loading-text').style.color = 'var(--yellow)';
+      } else {
+        $('loading-text').textContent = 'Failed to fetch playlist: ' + d.error;
+        $('loading-text').style.color = 'var(--red)';
+      }
+      // Refetch to show local tracks
+      fetchTracks();
+    });
+    es.addEventListener('playlist_skipped', () => {
+      isLoading = false;
+      loading.style.display = 'none';
+      btnSkipLoading.style.display = 'none';
+      btnLoadPlaylist.disabled = false;
+      btnLoadPlaylist.textContent = 'Load Playlist';
+      fetchTracks();
     });
     es.onerror = () => {};
   }
@@ -1726,6 +1981,7 @@ input[type="checkbox"] {
 
   // ---- Init ----
   player.init();
+  fetchConfig();
   fetchTracks();
   connectSSE();
 })();
@@ -1742,26 +1998,42 @@ def main():
     parser = argparse.ArgumentParser(description="Web UI for playlist downloader")
     parser.add_argument("-o", "--output", type=str, default=str(DEFAULT_OUTPUT_DIR),
                         help=f"Output directory (default: {DEFAULT_OUTPUT_DIR})")
-    parser.add_argument("-p", "--port", type=int, default=8080,
-                        help="Port to serve on (default: 8080)")
+    parser.add_argument("-p", "--port", type=int, default=5050,
+                        help="Port to serve on (default: 5050)")
     parser.add_argument("--no-browser", action="store_true",
                         help="Don't auto-open browser")
     parser.add_argument("--url", type=str, default=PLAYLIST_URL,
                         help="Override playlist URL")
+    parser.add_argument("--auto-fetch", action="store_true",
+                        help="Automatically fetch YouTube playlist on startup (default: local only)")
     args = parser.parse_args()
 
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     app_state["output_dir"] = output_dir
+    app_state["playlist_url"] = args.url
 
     print(f"Output directory: {output_dir}")
-    print(f"Fetching playlist...")
-    entries = get_playlist_entries(args.url)
-    app_state["entries"] = entries
-    app_state["completed"] = load_progress(output_dir)
 
-    print(f"Loaded {len(entries)} tracks, {len(app_state['completed'])} already downloaded.")
+    # Load completed and failed progress immediately (fast, local files)
+    app_state["completed"] = load_progress(output_dir)
+    app_state["failed"] = load_failed(output_dir)
+    print(f"Already completed: {len(app_state['completed'])}, previously failed: {len(app_state['failed'])}")
+
+    def fetch_playlist_async():
+        """Fetch playlist in background so UI can load immediately."""
+        print("Fetching playlist...")
+        try:
+            entries = get_playlist_entries(args.url)
+            app_state["entries"] = entries
+            app_state["loading"] = False
+            print(f"Loaded {len(entries)} tracks, {len(app_state['completed'])} already downloaded.")
+            broadcast_sse("playlist_loaded", {"count": len(entries)})
+        except Exception as e:
+            app_state["loading"] = False
+            print(f"Error fetching playlist: {e}")
+            broadcast_sse("playlist_error", {"error": str(e)})
 
     class ThreadedServer(HTTPServer):
         allow_reuse_address = True
@@ -1786,6 +2058,13 @@ def main():
     url = f"http://localhost:{args.port}"
     print(f"\nServer running at {url}")
     print("Press Ctrl+C to stop.\n")
+
+    # Start playlist fetch in background only if --auto-fetch is set
+    if args.auto_fetch:
+        app_state["loading"] = True
+        threading.Thread(target=fetch_playlist_async, daemon=True).start()
+    else:
+        print("Local mode: use 'Load Playlist' button in UI to fetch from YouTube")
 
     if not args.no_browser:
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()
