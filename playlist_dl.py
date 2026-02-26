@@ -17,7 +17,27 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 
 PLAYLIST_URL = ""  # Set via --url or environment
-DEFAULT_OUTPUT_DIR = Path.home() / "Music" / "playlist_download"
+
+# Detect WSL and use Windows music folder for consistency
+def _get_default_output_dir():
+    """Get the default output directory, preferring Windows path if in WSL."""
+    # Check if running in WSL
+    wsl_windows_path = Path("/mnt/c/Users")
+    if wsl_windows_path.exists():
+        # In WSL - try to find the Windows user's Music folder
+        for user_dir in wsl_windows_path.iterdir():
+            music_dir = user_dir / "Music" / "playlist_download"
+            if music_dir.exists():
+                return music_dir
+        # Fallback: use the first user with a Music folder
+        for user_dir in wsl_windows_path.iterdir():
+            music_dir = user_dir / "Music"
+            if music_dir.exists():
+                return music_dir / "playlist_download"
+    # Default to user's home Music folder
+    return Path.home() / "Music" / "playlist_download"
+
+DEFAULT_OUTPUT_DIR = _get_default_output_dir()
 BATCH_SIZE = 25
 CONCURRENT_DOWNLOADS = 4  # parallel downloads per batch
 PAUSE_BETWEEN_TRACKS = (1, 3)  # random sleep range between tracks in a batch

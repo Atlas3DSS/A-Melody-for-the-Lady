@@ -2360,9 +2360,10 @@ input[type="checkbox"] {
         }
       });
 
-      // Start playing if not already
-      if (!player.current) {
-        player.playNext();
+      // Start playing from the beginning
+      if (!player.currentTrack) {
+        player.currentIndex = 0;
+        player.loadAndPlay();
       }
 
       const modeNames = {random: 'Random', flow: 'Flow', anticluster: 'Variety'};
