@@ -55,7 +55,52 @@ def get_gemini_client():
             print("google-genai not installed. YouTube suggestions disabled.")
     return _gemini_client
 
-def search_youtube_via_gemini(query: str, num_results: int = 8) -> tuple[list[dict], str]:
+def optimize_music_query(raw_input: str) -> str:
+    """
+    Use Gemini to transform a track title or vibe description into optimized YouTube search terms.
+    """
+    client = get_gemini_client()
+    if not client:
+        return raw_input
+
+    try:
+        from google.genai import types
+
+        prompt = f"""You are a music expert. Given this input (either a song title or a vibe description),
+generate an optimized search query to find similar music on YouTube.
+
+Input: "{raw_input}"
+
+Think about:
+- What genre/subgenre is this? (e.g., dark ambient, lo-fi hip hop, acid techno)
+- What's the mood/energy? (e.g., melancholic, uplifting, aggressive, dreamy)
+- What are similar artists or tracks?
+- What era or scene does this belong to?
+
+Return ONLY a concise search query (max 10 words) that would find similar music.
+No explanation, just the search terms. Examples:
+- "dark ambient drone music like lustmord"
+- "90s acid techno rave classics"
+- "chill lo-fi beats jazz hop study music"
+"""
+
+        response = client.models.generate_content(
+            model="gemini-3.1-pro-preview",
+            contents=prompt,
+            config=types.GenerateContentConfig(temperature=0.7)
+        )
+        optimized = response.text.strip().strip('"').strip("'")
+        # Sanity check - if response is too long or weird, use original
+        if len(optimized) > 100 or '\n' in optimized:
+            return raw_input
+        print(f"Query optimized: '{raw_input}' -> '{optimized}'")
+        return optimized
+    except Exception as e:
+        print(f"Query optimization failed: {e}")
+        return raw_input
+
+
+def search_youtube_via_gemini(query: str, num_results: int = 8, optimize: bool = True) -> tuple[list[dict], str]:
     """
     Use Gemini with Google Search to find YouTube music videos.
     Returns tuple of (results, error_message).
@@ -65,10 +110,14 @@ def search_youtube_via_gemini(query: str, num_results: int = 8) -> tuple[list[di
     if not client:
         return [], "Gemini API not configured"
 
+    # Optimize the query first
+    if optimize:
+        query = optimize_music_query(query)
+
     try:
         from google.genai import types
 
-        prompt = f"""Find {num_results} YouTube music videos similar to or matching: "{query}"
+        prompt = f"""Find {num_results} YouTube music videos matching this music style/vibe: "{query}"
 
 Search for actual YouTube videos. For each result, extract:
 - The YouTube video ID (the 11-character code from the URL like "dQw4w9WgXcQ")
