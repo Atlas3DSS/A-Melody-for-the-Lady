@@ -58,12 +58,14 @@ VAE_AVAILABLE = ACE_VAE_PATH.exists()
 
 CLAP_MODEL_ID = "laion/larger_clap_music"
 EMBEDDINGS_FILE = "embeddings.npz"
+SEGMENT_EMBEDDINGS_FILE = "segment_embeddings.npz"  # Full track segmented embeddings
 DISCOVERY_EMBEDDINGS_FILE = "discovery_embeddings.npz"
 PREVIEW_DIR_NAME = "previews"
 AUDIO_EXTENSIONS = (".opus", ".mp3", ".m4a", ".ogg", ".webm")
 SAMPLE_RATE_VAE = 48000   # ACE-Step VAE expects 48kHz stereo
 SAMPLE_RATE_CLAP = 48000  # CLAP processor handles resampling
-MAX_DURATION = 120         # seconds — cap long mixes to save memory/time
+MAX_DURATION = 600         # seconds — increased to embed longer tracks fully
+SEGMENT_DURATION = 10      # seconds — each segment for CLAP embedding
 PREVIEW_DURATION = 30      # seconds — short clips for discovery embedding
 
 
@@ -259,6 +261,72 @@ def encode_clap(model, processor, audio_path: Path, device="cuda") -> np.ndarray
         return None
 
 
+def encode_clap_segments(model, processor, audio_path: Path, device="cuda",
+                         segment_duration: float = SEGMENT_DURATION) -> list[dict] | None:
+    """
+    Encode an entire audio file into multiple segment embeddings.
+
+    Returns a list of dicts, each containing:
+      - 'embedding': np.ndarray (512-dim CLAP embedding)
+      - 'start_time': float (seconds)
+      - 'end_time': float (seconds)
+      - 'segment_idx': int
+
+    This allows matching against ANY part of the track, not just the intro.
+    """
+    torch = _import_torch()
+    librosa = _import_librosa()
+
+    try:
+        # Load full audio (up to MAX_DURATION)
+        wav, sr = librosa.load(str(audio_path), sr=SAMPLE_RATE_CLAP, mono=True,
+                               duration=MAX_DURATION)
+
+        total_duration = len(wav) / sr
+        samples_per_segment = int(segment_duration * sr)
+
+        segments = []
+        segment_idx = 0
+
+        # Process in overlapping windows for better coverage
+        # Use 50% overlap to catch transitions
+        hop_samples = samples_per_segment // 2
+
+        for start_sample in range(0, len(wav) - samples_per_segment // 2, hop_samples):
+            end_sample = min(start_sample + samples_per_segment, len(wav))
+            segment_wav = wav[start_sample:end_sample]
+
+            # Skip very short segments at the end
+            if len(segment_wav) < samples_per_segment // 2:
+                continue
+
+            # Pad short final segment if needed
+            if len(segment_wav) < samples_per_segment:
+                segment_wav = np.pad(segment_wav, (0, samples_per_segment - len(segment_wav)))
+
+            inputs = processor(audio=segment_wav, sampling_rate=SAMPLE_RATE_CLAP,
+                               return_tensors="pt")
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+
+            with torch.no_grad():
+                embedding = model.get_audio_features(**inputs)
+                embedding = embedding.squeeze(0).cpu().numpy().astype(np.float32)
+
+            segments.append({
+                'embedding': embedding,
+                'start_time': start_sample / sr,
+                'end_time': end_sample / sr,
+                'segment_idx': segment_idx,
+            })
+            segment_idx += 1
+
+        return segments if segments else None
+
+    except Exception as e:
+        print(f"    CLAP segment encode error: {e}")
+        return None
+
+
 def encode_text_clap(model, processor, text: str, device="cuda") -> np.ndarray:
     """Encode a text query to a CLAP embedding."""
     torch = _import_torch()
@@ -311,6 +379,193 @@ def load_embeddings(music_dir: Path) -> dict:
         "vae": data["vae"],      # [N, 64]
         "clap": data["clap"],    # [N, 512]
     }
+
+
+def load_segment_embeddings(music_dir: Path) -> dict | None:
+    """Load segment embeddings from disk.
+
+    Returns dict with:
+      Track-level (for fast search):
+      - ids: list of unique track IDs
+      - titles: list of track titles
+      - mean_emb: (N_tracks, 512) mean of all segments per track
+      - max_emb: (N_tracks, 512) element-wise max of all segments per track
+      - std_emb: (N_tracks, 512) std deviation of segments (captures variation)
+
+      Segment-level (for fine-grained matching):
+      - segment_ids: list of track IDs (one per segment)
+      - segment_times: (N_segments, 2) array of [start_time, end_time]
+      - segment_emb: (N_segments, 512) individual segment embeddings
+    """
+    path = music_dir / SEGMENT_EMBEDDINGS_FILE
+    if not path.exists():
+        return None
+    data = np.load(path, allow_pickle=True)
+    return {
+        # Track-level aggregated
+        "ids": list(data["ids"]),
+        "titles": list(data["titles"]),
+        "mean_emb": data["mean_emb"],
+        "max_emb": data["max_emb"],
+        "std_emb": data["std_emb"],
+        # Segment-level
+        "segment_ids": list(data["segment_ids"]),
+        "segment_times": data["segment_times"],
+        "segment_emb": data["segment_emb"],
+    }
+
+
+def save_segment_embeddings(music_dir: Path, seg_data: dict):
+    """Save segment embeddings to disk."""
+    path = music_dir / SEGMENT_EMBEDDINGS_FILE
+    np.savez_compressed(
+        path,
+        # Track-level
+        ids=np.array(seg_data["ids"], dtype=object),
+        titles=np.array(seg_data["titles"], dtype=object),
+        mean_emb=np.array(seg_data["mean_emb"], dtype=np.float32),
+        max_emb=np.array(seg_data["max_emb"], dtype=np.float32),
+        std_emb=np.array(seg_data["std_emb"], dtype=np.float32),
+        # Segment-level
+        segment_ids=np.array(seg_data["segment_ids"], dtype=object),
+        segment_times=np.array(seg_data["segment_times"], dtype=np.float32),
+        segment_emb=np.array(seg_data["segment_emb"], dtype=np.float32),
+    )
+
+
+def find_similar_segments(seg_data: dict, video_id: str, n: int = 20,
+                          method: str = "hybrid") -> list[dict]:
+    """Find similar tracks using segment-level embeddings.
+
+    Methods:
+      - "mean": Use mean-pooled track embeddings (fast, general context)
+      - "max": Use max-pooled track embeddings (emphasizes prominent features)
+      - "meanmax": Concatenate mean+max for richer representation
+      - "segment": Match against individual segments, take best per track
+      - "hybrid": Combine meanmax track-level with segment-level refinement (best)
+    """
+    ids = seg_data["ids"]
+    titles = seg_data["titles"]
+    mean_emb = seg_data["mean_emb"]
+    max_emb = seg_data["max_emb"]
+    segment_ids = seg_data["segment_ids"]
+    segment_emb = seg_data["segment_emb"]
+    segment_times = seg_data["segment_times"]
+
+    if video_id not in ids:
+        return []
+
+    query_idx = ids.index(video_id)
+
+    if method == "mean":
+        query_vec = mean_emb[query_idx]
+        scores = cosine_sim_batch(mean_emb, query_vec)
+    elif method == "max":
+        query_vec = max_emb[query_idx]
+        scores = cosine_sim_batch(max_emb, query_vec)
+    elif method == "meanmax":
+        # Concatenate mean and max for richer representation
+        corpus = np.concatenate([mean_emb, max_emb], axis=1)  # (N, 1024)
+        query_vec = np.concatenate([mean_emb[query_idx], max_emb[query_idx]])
+        scores = cosine_sim_batch(corpus, query_vec)
+    elif method == "segment":
+        # Pure segment-level matching
+        query_seg_indices = [i for i, sid in enumerate(segment_ids) if sid == video_id]
+        query_seg_embs = segment_emb[query_seg_indices]
+        query_vec = query_seg_embs.mean(axis=0)
+
+        # Score all segments
+        all_scores = cosine_sim_batch(segment_emb, query_vec)
+
+        # Take max score per track
+        track_scores = {}
+        track_best_seg = {}
+        for i, (sid, score) in enumerate(zip(segment_ids, all_scores)):
+            if sid == video_id:
+                continue
+            if sid not in track_scores or score > track_scores[sid]:
+                track_scores[sid] = score
+                track_best_seg[sid] = i
+
+        # Build results
+        sorted_tracks = sorted(track_scores.items(), key=lambda x: x[1], reverse=True)[:n]
+        results = []
+        for sid, score in sorted_tracks:
+            seg_idx = track_best_seg[sid]
+            tid = ids.index(sid) if sid in ids else 0
+            results.append({
+                "id": sid,
+                "title": titles[tid] if tid < len(titles) else sid,
+                "score": float(score),
+                "match_time": float(segment_times[seg_idx][0]),
+                "source": "segment",
+            })
+        return results
+    else:  # hybrid - best of both worlds
+        # Stage 1: Fast track-level search with meanmax
+        corpus = np.concatenate([mean_emb, max_emb], axis=1)
+        query_vec = np.concatenate([mean_emb[query_idx], max_emb[query_idx]])
+        track_scores = cosine_sim_batch(corpus, query_vec)
+
+        # Stage 2: Refine top candidates with segment-level matching
+        # Get top 2N candidates for refinement
+        candidates = np.argsort(track_scores)[::-1][1:n*2+1]  # Skip self
+
+        # Get query's segment embeddings
+        query_seg_indices = [i for i, sid in enumerate(segment_ids) if sid == video_id]
+        query_seg_embs = segment_emb[query_seg_indices]
+        query_seg_mean = query_seg_embs.mean(axis=0)
+
+        refined_scores = {}
+        best_match_times = {}
+        for cand_idx in candidates:
+            cand_id = ids[cand_idx]
+            cand_seg_indices = [i for i, sid in enumerate(segment_ids) if sid == cand_id]
+            if not cand_seg_indices:
+                refined_scores[cand_id] = track_scores[cand_idx]
+                best_match_times[cand_id] = 0.0
+                continue
+
+            # Find best matching segment
+            cand_seg_embs = segment_emb[cand_seg_indices]
+            seg_scores = cosine_sim_batch(cand_seg_embs, query_seg_mean)
+            best_seg_local = np.argmax(seg_scores)
+            best_seg_global = cand_seg_indices[best_seg_local]
+
+            # Combine track-level and segment-level scores (0.6 track + 0.4 segment)
+            refined_scores[cand_id] = 0.6 * track_scores[cand_idx] + 0.4 * seg_scores[best_seg_local]
+            best_match_times[cand_id] = float(segment_times[best_seg_global][0])
+
+        # Sort by refined score
+        sorted_tracks = sorted(refined_scores.items(), key=lambda x: x[1], reverse=True)[:n]
+        results = []
+        for sid, score in sorted_tracks:
+            tid = ids.index(sid)
+            results.append({
+                "id": sid,
+                "title": titles[tid],
+                "score": float(score),
+                "match_time": best_match_times.get(sid, 0.0),
+                "source": "hybrid",
+            })
+        return results
+
+    # For non-segment methods, build results from track-level scores
+    sorted_indices = np.argsort(scores)[::-1]
+    results = []
+    for idx in sorted_indices:
+        if ids[idx] == video_id:
+            continue
+        results.append({
+            "id": ids[idx],
+            "title": titles[idx],
+            "score": float(scores[idx]),
+            "match_time": 0.0,
+            "source": method,
+        })
+        if len(results) >= n:
+            break
+    return results
 
 
 def find_similar(emb_data: dict, video_id: str, n: int = 20,
@@ -550,6 +805,148 @@ def cmd_embed(args):
     else:
         print(f"  VAE dims:  CLAP-only mode (zeros placeholder)")
     print(f"  CLAP dims: {all_clap.shape if len(all_clap) else 'empty'}")
+
+
+def cmd_embed_segments(args):
+    """Create segment-level embeddings for entire tracks.
+
+    This embeds the full audio in overlapping 10-second segments, storing:
+    - Track-level: mean, max, std pooled embeddings (for fast search)
+    - Segment-level: individual segment embeddings (for fine-grained matching)
+
+    Based on MIR research showing MeanMax pooling outperforms single strategies.
+    """
+    torch = _import_torch()
+    music_dir = Path(args.output)
+    device = args.device
+
+    audio_files = find_audio_files(music_dir)
+    if not audio_files:
+        print(f"No audio files found in {music_dir}")
+        return
+
+    print(f"Found {len(audio_files)} audio files")
+    print(f"Segment duration: {SEGMENT_DURATION}s with 50% overlap")
+    print(f"Max track duration: {MAX_DURATION}s")
+
+    # Load existing segment embeddings to resume
+    seg_path = music_dir / SEGMENT_EMBEDDINGS_FILE
+    existing_ids = set()
+    existing_data = None
+    if seg_path.exists():
+        existing_data = load_segment_embeddings(music_dir)
+        if existing_data:
+            existing_ids = set(existing_data["ids"])
+            print(f"Resuming: {len(existing_ids)} tracks already embedded")
+
+    new_files = [(vid, p) for vid, p in audio_files if vid not in existing_ids]
+    if not new_files:
+        print("All files already have segment embeddings. Nothing to do.")
+        return
+
+    print(f"Processing {len(new_files)} new tracks...\n")
+
+    # Load CLAP model
+    clap_model, clap_processor = load_clap(device=device)
+    print()
+
+    # Process each track
+    new_ids = []
+    new_titles = []
+    new_mean_emb = []
+    new_max_emb = []
+    new_std_emb = []
+    all_segment_ids = []
+    all_segment_times = []
+    all_segment_emb = []
+    failed = []
+
+    for i, (vid_id, fpath) in enumerate(new_files):
+        title = fpath.stem
+        pct = (i + 1) / len(new_files) * 100
+        safe_title = title[:50].encode('ascii', 'replace').decode('ascii')
+        print(f"[{i+1}/{len(new_files)}] ({pct:.0f}%) {safe_title}")
+
+        segments = encode_clap_segments(clap_model, clap_processor, fpath, device=device)
+
+        if segments is None or len(segments) == 0:
+            failed.append(vid_id)
+            print(f"    SKIPPED (encode failed)")
+            continue
+
+        # Extract embeddings
+        seg_embs = np.stack([s['embedding'] for s in segments])
+        seg_times = np.array([[s['start_time'], s['end_time']] for s in segments])
+
+        # Compute aggregated embeddings
+        mean_emb = seg_embs.mean(axis=0)
+        max_emb = seg_embs.max(axis=0)
+        std_emb = seg_embs.std(axis=0)
+
+        # Store track-level
+        new_ids.append(vid_id)
+        new_titles.append(title)
+        new_mean_emb.append(mean_emb)
+        new_max_emb.append(max_emb)
+        new_std_emb.append(std_emb)
+
+        # Store segment-level
+        for seg_emb, (start, end) in zip(seg_embs, seg_times):
+            all_segment_ids.append(vid_id)
+            all_segment_times.append([start, end])
+            all_segment_emb.append(seg_emb)
+
+        print(f"    {len(segments)} segments ({seg_times[-1][1]:.1f}s total)")
+
+        # Clear CUDA cache periodically
+        if (i + 1) % 10 == 0:
+            torch.cuda.empty_cache()
+
+    # Merge with existing data
+    if existing_data is not None and len(existing_data["ids"]) > 0:
+        all_ids = list(existing_data["ids"]) + new_ids
+        all_titles = list(existing_data["titles"]) + new_titles
+        all_mean = np.concatenate([existing_data["mean_emb"]] +
+                                  ([np.stack(new_mean_emb)] if new_mean_emb else []))
+        all_max = np.concatenate([existing_data["max_emb"]] +
+                                 ([np.stack(new_max_emb)] if new_max_emb else []))
+        all_std = np.concatenate([existing_data["std_emb"]] +
+                                 ([np.stack(new_std_emb)] if new_std_emb else []))
+        # Segment-level
+        merged_seg_ids = list(existing_data["segment_ids"]) + all_segment_ids
+        merged_seg_times = np.concatenate([existing_data["segment_times"]] +
+                                          ([np.stack(all_segment_times)] if all_segment_times else []))
+        merged_seg_emb = np.concatenate([existing_data["segment_emb"]] +
+                                        ([np.stack(all_segment_emb)] if all_segment_emb else []))
+    else:
+        all_ids = new_ids
+        all_titles = new_titles
+        all_mean = np.stack(new_mean_emb) if new_mean_emb else np.zeros((0, 512), dtype=np.float32)
+        all_max = np.stack(new_max_emb) if new_max_emb else np.zeros((0, 512), dtype=np.float32)
+        all_std = np.stack(new_std_emb) if new_std_emb else np.zeros((0, 512), dtype=np.float32)
+        merged_seg_ids = all_segment_ids
+        merged_seg_times = np.stack(all_segment_times) if all_segment_times else np.zeros((0, 2), dtype=np.float32)
+        merged_seg_emb = np.stack(all_segment_emb) if all_segment_emb else np.zeros((0, 512), dtype=np.float32)
+
+    # Save
+    save_segment_embeddings(music_dir, {
+        "ids": all_ids,
+        "titles": all_titles,
+        "mean_emb": all_mean,
+        "max_emb": all_max,
+        "std_emb": all_std,
+        "segment_ids": merged_seg_ids,
+        "segment_times": merged_seg_times,
+        "segment_emb": merged_seg_emb,
+    })
+
+    print(f"\nDone! Saved segment embeddings to {seg_path}")
+    print(f"  Tracks: {len(all_ids)}")
+    print(f"  Total segments: {len(merged_seg_ids)}")
+    print(f"  Track embeddings: mean={all_mean.shape}, max={all_max.shape}, std={all_std.shape}")
+    print(f"  Segment embeddings: {merged_seg_emb.shape}")
+    if failed:
+        print(f"  Failed: {len(failed)} tracks")
 
 
 def cmd_similar(args):
@@ -1146,6 +1543,12 @@ def main():
     p_embed.add_argument("--clap-only", action="store_true",
                          help="Use CLAP embeddings only (skip VAE even if available)")
 
+    # embed-segments
+    p_embed_seg = sub.add_parser("embed-segments",
+                                  help="Create full-track segment embeddings (mean/max/std + segments)")
+    p_embed_seg.add_argument("--segment-duration", type=float, default=SEGMENT_DURATION,
+                              help=f"Segment duration in seconds (default: {SEGMENT_DURATION})")
+
     # similar
     p_sim = sub.add_parser("similar", help="Find similar tracks")
     p_sim.add_argument("video_id", help="Video ID of the query track")
@@ -1202,6 +1605,8 @@ def main():
 
     if args.command == "embed":
         cmd_embed(args)
+    elif args.command == "embed-segments":
+        cmd_embed_segments(args)
     elif args.command == "similar":
         cmd_similar(args)
     elif args.command == "search":
