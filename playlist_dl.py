@@ -18,14 +18,24 @@ import threading
 
 PLAYLIST_URL = ""  # Set via --url or environment
 
-# Detect WSL and use Windows music folder for consistency
+# Look for Main Library relative to script, with fallbacks
 def _get_default_output_dir():
-    """Get the default output directory, preferring Windows path if in WSL."""
-    # Check if running in WSL
+    """Get the default output directory - Main Library folder next to the repo."""
+    script_dir = Path(__file__).resolve().parent
+
+    # Primary: Main Library folder next to the arc repo
+    main_library = script_dir.parent / "Main Library"
+    if main_library.exists():
+        return main_library
+
+    # WSL: Check for Main Library via /mnt/e path
+    wsl_main_library = Path("/mnt/e/Arcs Music Library/Main Library")
+    if wsl_main_library.exists():
+        return wsl_main_library
+
+    # Fallback: Check for old playlist_download in Windows Music folder
     wsl_windows_path = Path("/mnt/c/Users")
     if wsl_windows_path.exists():
-        # In WSL - try to find the Windows user's Music folder
-        # Skip system/service accounts
         skip_users = {'defaultuser100000', 'Default', 'Public', 'Default User', 'All Users'}
         try:
             for user_dir in wsl_windows_path.iterdir():
@@ -37,20 +47,12 @@ def _get_default_output_dir():
                         return music_dir
                 except PermissionError:
                     continue
-            # Fallback: use the first user with a Music folder
-            for user_dir in wsl_windows_path.iterdir():
-                if user_dir.name in skip_users:
-                    continue
-                try:
-                    music_dir = user_dir / "Music"
-                    if music_dir.exists():
-                        return music_dir / "playlist_download"
-                except PermissionError:
-                    continue
         except PermissionError:
             pass
-    # Default to user's home Music folder
-    return Path.home() / "Music" / "playlist_download"
+
+    # Last resort: Create Main Library next to repo
+    main_library.mkdir(parents=True, exist_ok=True)
+    return main_library
 
 DEFAULT_OUTPUT_DIR = _get_default_output_dir()
 BATCH_SIZE = 25

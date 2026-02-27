@@ -235,10 +235,16 @@ def save_feedback(output_dir: Path, entry: dict):
 
 try:
     import numpy as np
-    from recommender import find_similar, load_discovery_embeddings
+    from recommender import find_similar, load_discovery_embeddings, load_segment_embeddings
     _HAS_RECOMMENDER = True
 except ImportError:
     _HAS_RECOMMENDER = False
+
+try:
+    from umap import UMAP
+    _HAS_UMAP = True
+except ImportError:
+    _HAS_UMAP = False
 
 # ---------------------------------------------------------------------------
 # Global state
@@ -258,6 +264,10 @@ app_state = {
     "embeddings_mtime": 0,
     "discovery_embeddings": None,
     "discovery_mtime": 0,
+    "segment_embeddings": None,
+    "segment_mtime": 0,
+    "sonic_map": None,  # Cached 2D UMAP projection
+    "sonic_map_mtime": 0,
 }
 
 sse_clients: list[queue.Queue] = []
@@ -310,6 +320,21 @@ def get_discovery_embeddings():
             app_state["output_dir"])
         app_state["discovery_mtime"] = mtime
     return app_state["discovery_embeddings"]
+
+
+def get_segment_embeddings():
+    """Load segment embeddings from disk, cached and auto-refreshed."""
+    if not _HAS_RECOMMENDER:
+        return None
+    emb_path = app_state["output_dir"] / "segment_embeddings.npz"
+    if not emb_path.exists():
+        return None
+    mtime = emb_path.stat().st_mtime
+    if app_state["segment_embeddings"] is None or mtime > app_state["segment_mtime"]:
+        app_state["segment_embeddings"] = load_segment_embeddings(
+            app_state["output_dir"])
+        app_state["segment_mtime"] = mtime
+    return app_state["segment_embeddings"]
 
 
 def download_worker(ids: list[str]):
@@ -404,17 +429,45 @@ def download_worker(ids: list[str]):
 
 
 def find_file_by_id(video_id: str, extensions: tuple[str, ...]) -> Path | None:
-    """Find a file containing [video_id] in its name with one of the given extensions."""
+    """Find a file by video_id (or local_ hash ID) with one of the given extensions."""
+    import hashlib
     output_dir = app_state["output_dir"]
-    tag = f"[{video_id}]"
+
+    # Standard YouTube ID - look for [video_id] in filename
+    if not video_id.startswith("local_"):
+        tag = f"[{video_id}]"
+        for f in output_dir.iterdir():
+            if tag in f.name and f.suffix.lstrip(".") in extensions:
+                return f
+        return None
+
+    # Local file ID - regenerate hash to find matching file
+    target_hash = video_id[6:]  # Strip "local_" prefix
     for f in output_dir.iterdir():
-        if tag in f.name and f.suffix.lstrip(".") in extensions:
+        if f.suffix.lstrip(".") not in extensions:
+            continue
+        # Check if this file's hash matches
+        stem = f.stem
+        h = hashlib.md5(stem.encode('utf-8')).hexdigest()[:11]
+        if h == target_hash:
             return f
     return None
 
 
+def generate_file_id(filepath: Path) -> str:
+    """Generate a stable ID for a file without a video ID, using filename hash."""
+    import hashlib
+    stem = filepath.stem
+    h = hashlib.md5(stem.encode('utf-8')).hexdigest()[:11]
+    return f"local_{h}"
+
+
 def scan_downloaded_tracks() -> list[dict]:
-    """Scan output directory for downloaded audio files and return track entries."""
+    """Scan output directory for downloaded audio files and return track entries.
+
+    Handles both YouTube downloads (with [video_id] in filename) and arbitrary
+    audio files dropped into the folder.
+    """
     import re
     output_dir = app_state["output_dir"]
     audio_exts = (".mp3", ".opus", ".m4a", ".ogg", ".webm")
@@ -422,22 +475,28 @@ def scan_downloaded_tracks() -> list[dict]:
     seen_ids = set()
 
     # Pattern to extract video ID from filename: "Title [VIDEO_ID].ext"
-    id_pattern = re.compile(r'\[([a-zA-Z0-9_-]{11})\]')
+    id_pattern = re.compile(r'\[([a-zA-Z0-9_-]+)\]')
 
-    for f in output_dir.iterdir():
+    for f in sorted(output_dir.iterdir()):
         if not f.is_file() or f.suffix.lower() not in audio_exts:
             continue
+
         match = id_pattern.search(f.stem)
         if match:
             vid_id = match.group(1)
-            if vid_id in seen_ids:
-                continue
-            seen_ids.add(vid_id)
             # Extract title (everything before the [ID])
             title = f.stem[:match.start()].strip()
             if not title:
                 title = vid_id
-            tracks.append({"id": vid_id, "title": title})
+        else:
+            # No video ID - generate hash-based ID and use filename as title
+            vid_id = generate_file_id(f)
+            title = f.stem
+
+        if vid_id in seen_ids:
+            continue
+        seen_ids.add(vid_id)
+        tracks.append({"id": vid_id, "title": title})
 
     return tracks
 
@@ -474,6 +533,8 @@ class Handler(BaseHTTPRequestHandler):
             self._api_semantic_search(qs)
         elif path == "/api/embeddings-status":
             self._api_embeddings_status()
+        elif path == "/api/sonic-map":
+            self._api_sonic_map()
         elif path.startswith("/api/audio/") and path.endswith("/thumb"):
             vid_id = path[len("/api/audio/"):-len("/thumb")]
             self._api_thumb(vid_id)
@@ -491,13 +552,13 @@ class Handler(BaseHTTPRequestHandler):
             self._api_duplicates(qs)
         elif path == "/api/youtube-search":
             self._api_youtube_search(qs)
-        elif path == "/api/smart-shuffle":
-            self._api_smart_shuffle(qs)
         else:
             self.send_error(404)
 
     def do_POST(self):
-        if self.path == "/api/download":
+        if self.path == "/api/smart-shuffle":
+            self._api_smart_shuffle_post()
+        elif self.path == "/api/download":
             self._api_download()
         elif self.path == "/api/cancel":
             self._api_cancel()
@@ -511,6 +572,10 @@ class Handler(BaseHTTPRequestHandler):
             self._api_open_folder()
         elif self.path == "/api/feedback":
             self._api_feedback()
+        elif self.path == "/api/vibe-flow":
+            self._api_vibe_flow()
+        elif self.path == "/api/next-similar":
+            self._api_next_similar()
         else:
             self.send_error(404)
 
@@ -535,32 +600,33 @@ class Handler(BaseHTTPRequestHandler):
     def _api_tracks(self):
         state = app_state
         tracks = []
+        seen_ids = set()
 
-        # If playlist is loaded, use it; otherwise scan directory for downloaded files
+        # Always scan local directory first - this includes all downloaded files
+        scanned = scan_downloaded_tracks()
+        for i, e in enumerate(scanned):
+            vid_id = e["id"]
+            seen_ids.add(vid_id)
+            tracks.append({
+                "index": i + 1, "id": vid_id,
+                "title": e["title"], "status": "downloaded",
+            })
+
+        # If playlist is loaded, add any pending/failed entries not in local files
         if state["entries"]:
-            # Use full playlist
-            for i, e in enumerate(state["entries"]):
+            for e in state["entries"]:
                 vid_id = e["id"]
+                if vid_id in seen_ids:
+                    continue  # Already added from local scan
                 if vid_id == state.get("current_id"):
                     status = "downloading"
-                elif vid_id in state["completed"]:
-                    status = "downloaded"
                 elif vid_id in state["failed"]:
                     status = "failed"
                 else:
                     status = "pending"
                 tracks.append({
-                    "index": i + 1, "id": vid_id,
+                    "index": len(tracks) + 1, "id": vid_id,
                     "title": e["title"], "status": status,
-                })
-        else:
-            # Playlist not loaded yet - scan directory for downloaded tracks
-            scanned = scan_downloaded_tracks()
-            for i, e in enumerate(scanned):
-                vid_id = e["id"]
-                tracks.append({
-                    "index": i + 1, "id": vid_id,
-                    "title": e["title"], "status": "downloaded",
                 })
 
         self._json_response({
@@ -748,13 +814,179 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             self._json_response({"error": str(e)}, 500)
 
+    def _api_vibe_flow(self):
+        """Generate a Flow shuffle starting from a text vibe/mood description.
+
+        POST body: {"prompt": "dark techno heavy bass", "energy_arc": "none"}
+        Returns shuffled track order starting from best semantic match.
+        """
+        body = self._read_json_body()
+        prompt = body.get("prompt", "").strip()
+        energy_arc = body.get("energy_arc", "none")
+
+        if not prompt:
+            self._json_response({"error": "No prompt provided"}, 400)
+            return
+
+        emb_data = get_embeddings()
+        if emb_data is None:
+            self._json_response({"error": "No embeddings found"}, 404)
+            return
+
+        try:
+            from recommender import search_by_text, load_clap
+            if app_state.get("clap_model") is None:
+                app_state["clap_model"], app_state["clap_processor"] = load_clap(device="cuda")
+
+            # Find best matching track for the vibe
+            results = search_by_text(
+                emb_data, app_state["clap_model"], app_state["clap_processor"],
+                prompt, n=1, device="cuda")
+
+            if not results:
+                self._json_response({"error": "No matching tracks found"}, 404)
+                return
+
+            seed_id = results[0]["id"]
+
+            # Get all downloaded tracks
+            track_ids = list(emb_data["ids"])
+
+            # Use the regular shuffle implementation with seed
+            mode = "trajectory" if energy_arc != "none" else "flow"
+            self._api_smart_shuffle_impl(mode, track_ids, seed=seed_id, energy_arc=energy_arc)
+
+        except ImportError:
+            self._json_response({"error": "CLAP model not available"}, 501)
+        except Exception as e:
+            self._json_response({"error": str(e)}, 500)
+
+    def _api_next_similar(self):
+        """Get the most similar track to the current one, excluding already played tracks.
+
+        POST body: {"current": "track_id", "exclude": ["id1", "id2", ...]}
+        Returns: {"next": {"id": "...", "title": "..."}} or {"next": null}
+        """
+        body = self._read_json_body()
+        current_id = body.get("current")
+        exclude = set(body.get("exclude", []))
+
+        if not current_id:
+            self._json_response({"error": "No current track provided"}, 400)
+            return
+
+        emb_data = get_embeddings()
+        if not emb_data:
+            self._json_response({"next": None, "error": "No embeddings"})
+            return
+
+        ids = emb_data["ids"]
+        titles = emb_data["titles"]
+        clap = emb_data["clap"]
+
+        # Find current track index
+        id_to_idx = {vid: i for i, vid in enumerate(ids)}
+        if current_id not in id_to_idx:
+            self._json_response({"next": None, "error": "Current track not found in embeddings"})
+            return
+
+        current_idx = id_to_idx[current_id]
+        current_emb = clap[current_idx]
+
+        # Normalize for cosine similarity
+        current_norm = current_emb / (np.linalg.norm(current_emb) + 1e-8)
+
+        # Find most similar track not in exclude list
+        best_idx = None
+        best_sim = -2
+        for i, vid in enumerate(ids):
+            if vid in exclude or vid == current_id:
+                continue
+            emb_norm = clap[i] / (np.linalg.norm(clap[i]) + 1e-8)
+            sim = float(np.dot(current_norm, emb_norm))
+            if sim > best_sim:
+                best_sim = sim
+                best_idx = i
+
+        if best_idx is None:
+            self._json_response({"next": None, "message": "No more tracks available"})
+            return
+
+        self._json_response({
+            "next": {"id": ids[best_idx], "title": titles[best_idx]},
+            "similarity": best_sim
+        })
+
     def _api_embeddings_status(self):
         """Return status of the embeddings file."""
-        emb_data = get_embeddings() if _HAS_RECOMMENDER else None
-        if emb_data:
-            self._json_response({"available": True, "count": len(emb_data["ids"])})
-        else:
+        if not _HAS_RECOMMENDER:
             self._json_response({"available": False, "count": 0})
+            return
+        # Prefer segment embeddings (more complete), fall back to old embeddings
+        seg_data = get_segment_embeddings()
+        if seg_data:
+            self._json_response({"available": True, "count": len(seg_data["ids"]), "type": "segment"})
+        else:
+            emb_data = get_embeddings()
+            if emb_data:
+                self._json_response({"available": True, "count": len(emb_data["ids"]), "type": "legacy"})
+            else:
+                self._json_response({"available": False, "count": 0})
+
+    def _api_sonic_map(self):
+        """Return 2D UMAP projection of track embeddings for visualization."""
+        if not _HAS_RECOMMENDER or not _HAS_UMAP:
+            self._json_response({
+                "available": False,
+                "error": "UMAP not available" if not _HAS_UMAP else "Embeddings not available"
+            })
+            return
+
+        emb_data = get_embeddings()
+        if not emb_data or len(emb_data["ids"]) < 10:
+            self._json_response({"available": False, "error": "Need at least 10 embedded tracks"})
+            return
+
+        emb_path = app_state["output_dir"] / "embeddings.npz"
+        mtime = emb_path.stat().st_mtime if emb_path.exists() else 0
+
+        # Use cached projection if embeddings haven't changed
+        if app_state["sonic_map"] is not None and mtime <= app_state["sonic_map_mtime"]:
+            self._json_response(app_state["sonic_map"])
+            return
+
+        # Compute UMAP projection
+        try:
+            ids = emb_data["ids"]
+            titles = emb_data["titles"]
+            clap = emb_data["clap"]
+
+            # UMAP to 2D
+            reducer = UMAP(n_components=2, n_neighbors=15, min_dist=0.1, metric='cosine', random_state=42)
+            coords_2d = reducer.fit_transform(clap)
+
+            # Normalize to 0-1 range
+            mins = coords_2d.min(axis=0)
+            maxs = coords_2d.max(axis=0)
+            coords_norm = (coords_2d - mins) / (maxs - mins + 1e-8)
+
+            # Build response
+            tracks = []
+            for i, (vid_id, title) in enumerate(zip(ids, titles)):
+                tracks.append({
+                    "id": vid_id,
+                    "title": title[:50],
+                    "x": float(coords_norm[i, 0]),
+                    "y": float(coords_norm[i, 1]),
+                })
+
+            result = {"available": True, "tracks": tracks, "count": len(tracks)}
+            app_state["sonic_map"] = result
+            app_state["sonic_map_mtime"] = mtime
+            self._json_response(result)
+
+        except Exception as e:
+            self._json_response({"available": False, "error": str(e)})
 
     def _api_tags(self):
         """Return all track tags from track_tags.json."""
@@ -851,12 +1083,35 @@ class Handler(BaseHTTPRequestHandler):
             response["message"] = error_msg
         self._json_response(response)
 
+    def _api_smart_shuffle_post(self):
+        """POST version of smart shuffle - handles large track lists."""
+        body = self._read_json_body()
+        mode = body.get("mode", "random")
+        track_ids = body.get("ids", [])
+        seed = body.get("seed")  # Optional: starting track ID
+        energy_arc = body.get("energy_arc", "none")  # none, rise, fall, peak, chill
+        if isinstance(track_ids, str):
+            track_ids = [tid for tid in track_ids.split(",") if tid]
+        self._api_smart_shuffle_impl(mode, track_ids, seed=seed, energy_arc=energy_arc)
+
     def _api_smart_shuffle(self, qs: str):
-        """Return track IDs in smart shuffle order."""
+        """GET version of smart shuffle (for small track lists)."""
         params = parse_qs(qs)
         mode = params.get("mode", ["random"])[0]
         track_ids = params.get("ids", [""])[0].split(",")
-        track_ids = [tid for tid in track_ids if tid]  # Filter empty
+        track_ids = [tid for tid in track_ids if tid]
+        seed = params.get("seed", [None])[0]
+        self._api_smart_shuffle_impl(mode, track_ids, seed=seed)
+
+    def _api_smart_shuffle_impl(self, mode: str, track_ids: list, seed: str = None, energy_arc: str = "none"):
+        """Core smart shuffle implementation.
+
+        Args:
+            mode: shuffle mode (random, flow, anticluster, dj, trajectory)
+            track_ids: list of track IDs to shuffle
+            seed: optional starting track ID (for flow/dj modes)
+            energy_arc: energy trajectory (none, rise, fall, peak, chill)
+        """
 
         if not track_ids:
             self._json_response({"error": "No track IDs provided"}, 400)
@@ -880,17 +1135,21 @@ class Handler(BaseHTTPRequestHandler):
             self._json_response({"order": shuffled, "mode": "random", "message": "Embeddings not available, using random"})
             return
 
-        emb_data = get_embeddings()
-        if not emb_data:
-            import random
-            shuffled = track_ids[:]
-            random.shuffle(shuffled)
-            self._json_response({"order": shuffled, "mode": "random", "message": "Embeddings not loaded, using random"})
-            return
-
-        # Get embeddings for requested tracks
-        ids = emb_data["ids"]
-        clap = emb_data["clap"]
+        # Try segment embeddings first (more complete), fall back to old embeddings
+        seg_data = get_segment_embeddings()
+        if seg_data:
+            ids = seg_data["ids"]
+            clap = seg_data["mean_emb"]  # Use mean embedding as track-level representation
+        else:
+            emb_data = get_embeddings()
+            if not emb_data:
+                import random
+                shuffled = track_ids[:]
+                random.shuffle(shuffled)
+                self._json_response({"order": shuffled, "mode": "random", "message": "Embeddings not loaded, using random"})
+                return
+            ids = emb_data["ids"]
+            clap = emb_data["clap"]
 
         # Build index mapping
         id_to_idx = {vid: i for i, vid in enumerate(ids)}
@@ -903,60 +1162,247 @@ class Handler(BaseHTTPRequestHandler):
         valid_embs = np.stack([clap[id_to_idx[tid]] for tid in valid_ids])
 
         if mode == "flow":
-            # Start from random, always pick most similar unplayed track
+            # Start from seed (or random), always pick most similar unplayed track
+            # Optimized with numpy masking for O(n) per-step instead of O(n) python loop
             import random
-            remaining = set(range(len(valid_ids)))
-            start = random.choice(list(remaining))
-            remaining.remove(start)
-            order = [start]
+            n = len(valid_ids)
+
+            # Use seed if provided and valid, otherwise random
+            if seed and seed in valid_ids:
+                start = valid_ids.index(seed)
+            else:
+                start = random.randint(0, n - 1)
 
             # Precompute similarity matrix
             norms = np.linalg.norm(valid_embs, axis=1, keepdims=True)
             normed = valid_embs / (norms + 1e-8)
             sim_matrix = normed @ normed.T
 
-            while remaining:
+            # Track availability with numpy array
+            available = np.ones(n, dtype=bool)
+            available[start] = False
+            order = [start]
+
+            for _ in range(n - 1):
                 current = order[-1]
-                # Find most similar among remaining
-                best_idx = None
-                best_sim = -1
-                for idx in remaining:
-                    if sim_matrix[current, idx] > best_sim:
-                        best_sim = sim_matrix[current, idx]
-                        best_idx = idx
+                sims = sim_matrix[current].copy()
+                sims[~available] = -np.inf
+                best_idx = int(np.argmax(sims))
                 order.append(best_idx)
-                remaining.remove(best_idx)
+                available[best_idx] = False
 
             shuffled = [valid_ids[i] for i in order]
 
         elif mode == "anticluster":
-            # Start from random, always pick LEAST similar to recent tracks
+            # Start from seed (or random), always pick LEAST similar to recent tracks
+            # Optimized with numpy operations
             import random
-            remaining = set(range(len(valid_ids)))
-            start = random.choice(list(remaining))
-            remaining.remove(start)
-            order = [start]
+            n = len(valid_ids)
+
+            # Use seed if provided and valid, otherwise random
+            if seed and seed in valid_ids:
+                start = valid_ids.index(seed)
+            else:
+                start = random.randint(0, n - 1)
 
             # Precompute similarity matrix
             norms = np.linalg.norm(valid_embs, axis=1, keepdims=True)
             normed = valid_embs / (norms + 1e-8)
             sim_matrix = normed @ normed.T
 
-            while remaining:
-                # Average similarity to last 3 tracks
+            available = np.ones(n, dtype=bool)
+            available[start] = False
+            order = [start]
+
+            for _ in range(n - 1):
+                # Average similarity to last 3 tracks (vectorized)
                 recent = order[-3:] if len(order) >= 3 else order
-                best_idx = None
-                best_dissim = -1
-                for idx in remaining:
-                    avg_sim = sum(sim_matrix[r, idx] for r in recent) / len(recent)
-                    dissim = 1 - avg_sim
-                    if dissim > best_dissim:
-                        best_dissim = dissim
-                        best_idx = idx
+                avg_sims = sim_matrix[recent].mean(axis=0)
+                avg_sims[~available] = np.inf  # We want minimum similarity
+                best_idx = int(np.argmin(avg_sims))
                 order.append(best_idx)
-                remaining.remove(best_idx)
+                available[best_idx] = False
 
             shuffled = [valid_ids[i] for i in order]
+
+        elif mode == "dj":
+            # DJ Mode: Match ending segments of current track to beginning of next
+            # Creates smooth transitions like a professional DJ set
+            import random
+            seg_data = get_segment_embeddings()
+            if not seg_data:
+                shuffled = valid_ids[:]
+                random.shuffle(shuffled)
+                self._json_response({"order": shuffled, "mode": "random", "message": "Segment embeddings not available, using random"})
+                return
+
+            seg_ids = seg_data["segment_ids"]
+            seg_times = seg_data["segment_times"]
+            seg_emb = seg_data["segment_emb"]
+
+            # Group segment indices by track ID
+            track_segments = {}
+            for i, tid in enumerate(seg_ids):
+                if tid not in track_segments:
+                    track_segments[tid] = []
+                track_segments[tid].append(i)
+
+            # Filter to tracks we have segments for
+            dj_ids = [tid for tid in valid_ids if tid in track_segments]
+            if len(dj_ids) < 2:
+                shuffled = valid_ids[:]
+                random.shuffle(shuffled)
+                self._json_response({"order": shuffled, "mode": "random", "message": "Not enough tracks with segments"})
+                return
+
+            # For each track, compute embedding for ending (last 30s) and beginning (first 20s)
+            # Using 30s for endings to skip past fade-outs and dead sound at track ends
+            END_BOUNDARY_SECONDS = 30
+            BEGIN_BOUNDARY_SECONDS = 20
+            end_embs = {}  # tid -> embedding of ending region
+            begin_embs = {}  # tid -> embedding of beginning region
+
+            for tid in dj_ids:
+                indices = track_segments[tid]
+                times = seg_times[indices]
+                embs = seg_emb[indices]
+
+                # Ending: segments where end_time >= max_end - END_BOUNDARY_SECONDS
+                max_end = times[:, 1].max()
+                end_mask = times[:, 1] >= (max_end - END_BOUNDARY_SECONDS)
+                if end_mask.any():
+                    end_embs[tid] = embs[end_mask].mean(axis=0)
+                else:
+                    end_embs[tid] = embs[-1]
+
+                # Beginning: segments where start_time <= BEGIN_BOUNDARY_SECONDS
+                begin_mask = times[:, 0] <= BEGIN_BOUNDARY_SECONDS
+                if begin_mask.any():
+                    begin_embs[tid] = embs[begin_mask].mean(axis=0)
+                else:
+                    begin_embs[tid] = embs[0]
+
+            # Normalize for cosine similarity
+            def normalize(v):
+                n = np.linalg.norm(v)
+                return v / n if n > 0 else v
+
+            for tid in dj_ids:
+                end_embs[tid] = normalize(end_embs[tid])
+                begin_embs[tid] = normalize(begin_embs[tid])
+
+            # Greedy matching: start from seed (or random), pick next track whose beginning matches current ending
+            # Optimized: pre-compute similarity matrix for O(n²) -> O(n) per-step lookups
+            n_dj = len(dj_ids)
+            id_to_dj_idx = {tid: i for i, tid in enumerate(dj_ids)}
+
+            # Stack embeddings into matrices for fast batch computation
+            end_matrix = np.stack([end_embs[tid] for tid in dj_ids])  # (n, 512)
+            begin_matrix = np.stack([begin_embs[tid] for tid in dj_ids])  # (n, 512)
+
+            # Pre-compute full similarity matrix: end[i] dot begin[j]
+            # This is O(n² * d) but done once with fast BLAS
+            sim_matrix = end_matrix @ begin_matrix.T  # (n, n)
+
+            # Track which indices are still available
+            available = np.ones(n_dj, dtype=bool)
+
+            # Use seed if provided and valid, otherwise random
+            if seed and seed in id_to_dj_idx:
+                start_idx = id_to_dj_idx[seed]
+            else:
+                start_idx = random.randint(0, n_dj - 1)
+
+            available[start_idx] = False
+            order_indices = [start_idx]
+
+            # Greedy selection using pre-computed similarities
+            for _ in range(n_dj - 1):
+                current_idx = order_indices[-1]
+                # Get similarities from current track's ending to all beginnings
+                sims = sim_matrix[current_idx].copy()
+                # Mask out unavailable tracks with -inf
+                sims[~available] = -np.inf
+                # Pick best
+                best_idx = int(np.argmax(sims))
+                order_indices.append(best_idx)
+                available[best_idx] = False
+
+            order = [dj_ids[i] for i in order_indices]
+
+            # Add any tracks that weren't in segment data
+            remaining_no_seg = [tid for tid in valid_ids if tid not in track_segments]
+            random.shuffle(remaining_no_seg)
+            order.extend(remaining_no_seg)
+
+            shuffled = order
+
+        elif mode == "trajectory":
+            # Trajectory mode: arrange tracks based on energy arc
+            # Uses embedding norm as energy proxy, then sorts by desired pattern
+            import random
+
+            # Compute "energy" for each track using embedding norm and variance
+            # Higher norm = more intensity, higher std = more complexity
+            energies = {}
+            for i, tid in enumerate(valid_ids):
+                emb = valid_embs[i]
+                # Energy score: combination of norm and standard deviation
+                norm = np.linalg.norm(emb)
+                std = np.std(emb)
+                energies[tid] = norm * 0.5 + std * 50  # Weighted combination
+
+            # Normalize energy scores to 0-1
+            min_e = min(energies.values())
+            max_e = max(energies.values())
+            range_e = max_e - min_e if max_e > min_e else 1
+            for tid in energies:
+                energies[tid] = (energies[tid] - min_e) / range_e
+
+            # Create target energy curve based on arc type
+            n = len(valid_ids)
+            target_energies = []
+            if energy_arc == "rise":
+                # Gradually increase energy: 0.2 -> 1.0
+                target_energies = [0.2 + 0.8 * (i / (n - 1)) for i in range(n)]
+            elif energy_arc == "fall":
+                # Gradually decrease energy: 1.0 -> 0.2
+                target_energies = [1.0 - 0.8 * (i / (n - 1)) for i in range(n)]
+            elif energy_arc == "peak":
+                # Build up then drop: 0.2 -> 1.0 -> 0.4
+                mid = n // 2
+                target_energies = []
+                for i in range(n):
+                    if i <= mid:
+                        target_energies.append(0.2 + 0.8 * (i / mid))
+                    else:
+                        target_energies.append(1.0 - 0.6 * ((i - mid) / (n - mid)))
+            elif energy_arc == "chill":
+                # Stay low energy throughout: 0.2 -> 0.4 gentle wave
+                target_energies = [0.2 + 0.2 * np.sin(np.pi * i / n) for i in range(n)]
+            else:
+                # Default: gentle rise
+                target_energies = [0.3 + 0.4 * (i / (n - 1)) for i in range(n)]
+
+            # Match tracks to target energies greedily
+            # For each position, find the unassigned track closest to target energy
+            remaining_tracks = set(valid_ids)
+            shuffled = []
+
+            # If seed provided, start with it
+            if seed and seed in remaining_tracks:
+                shuffled.append(seed)
+                remaining_tracks.remove(seed)
+                # Adjust target_energies to skip first slot
+                target_energies = target_energies[1:]
+
+            for target in target_energies:
+                if not remaining_tracks:
+                    break
+                # Find track with energy closest to target
+                best_tid = min(remaining_tracks, key=lambda t: abs(energies[t] - target))
+                shuffled.append(best_tid)
+                remaining_tracks.remove(best_tid)
 
         else:
             # Unknown mode, fall back to random
@@ -964,7 +1410,7 @@ class Handler(BaseHTTPRequestHandler):
             shuffled = valid_ids[:]
             random.shuffle(shuffled)
 
-        self._json_response({"order": shuffled, "mode": mode})
+        self._json_response({"order": shuffled, "mode": mode, "energy_arc": energy_arc})
 
     def _api_audio(self, video_id: str):
         """Serve audio file with HTTP Range support for seeking."""
@@ -1273,6 +1719,24 @@ input[type="text"]::placeholder { color: var(--text2); }
 .shuffle-menu button:first-child { border-radius: 8px 8px 0 0; }
 .shuffle-menu button:last-child { border-radius: 0 0 8px 8px; }
 
+/* Track context menu */
+.track-context-menu {
+  position: fixed; z-index: 200;
+  background: var(--bg2); border: 1px solid var(--border); border-radius: 8px;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.5); min-width: 180px;
+  display: none;
+}
+.track-context-menu.visible { display: block; }
+.track-context-menu button {
+  display: block; width: 100%; padding: 0.6rem 1rem; text-align: left;
+  background: transparent; border: none; color: var(--text); cursor: pointer;
+  font-size: 0.85rem;
+}
+.track-context-menu button:hover { background: var(--bg3); }
+.track-context-menu button:first-child { border-radius: 8px 8px 0 0; }
+.track-context-menu button:last-child { border-radius: 0 0 8px 8px; }
+.track-context-menu hr { margin: 0.2rem 0; border-color: var(--border); }
+
 .filters { display: flex; gap: 0.35rem; flex-wrap: wrap; }
 .pill {
   padding: 0.35rem 0.75rem; border-radius: 20px;
@@ -1468,6 +1932,17 @@ input[type="checkbox"] {
   border-bottom: 1px solid var(--wa-border);
   position: relative;
   overflow: hidden;
+  cursor: pointer;
+  transition: all 0.3s ease;
+}
+.wa-visualizer.fullscreen {
+  position: fixed !important;
+  top: 0 !important;
+  left: 0 !important;
+  width: 100vw !important;
+  height: 100vh !important;
+  z-index: 10000 !important;
+  border: none !important;
 }
 .wa-visualizer::before {
   content: '';
@@ -1479,12 +1954,41 @@ input[type="checkbox"] {
   pointer-events: none;
   z-index: 1;
 }
+.wa-visualizer.fullscreen::before { display: none; }
 .wa-visualizer canvas {
   width: 100%;
   height: 100%;
   display: block;
   position: relative;
   z-index: 0;
+}
+.wa-viz-fullscreen-btn {
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  z-index: 10;
+  background: rgba(0,0,0,0.6);
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  padding: 3px 8px;
+  font-size: 11px;
+  cursor: pointer;
+  border-radius: 3px;
+  opacity: 0;
+  transition: opacity 0.2s;
+}
+.wa-visualizer:hover .wa-viz-fullscreen-btn { opacity: 1; }
+.wa-viz-fullscreen-btn:hover { background: var(--accent); color: #000; }
+.wa-viz-mode-label {
+  position: absolute;
+  bottom: 5px;
+  left: 5px;
+  z-index: 10;
+  color: var(--accent);
+  font-size: 10px;
+  text-transform: uppercase;
+  opacity: 0.6;
+  pointer-events: none;
 }
 
 /* ---- LCD display - Neon ---- */
@@ -1740,6 +2244,67 @@ input[type="checkbox"] {
 }
 .wa-pl-remove:hover { color: var(--red); }
 
+/* ===== PANEL TABS ===== */
+.wa-panel-tabs {
+  background: linear-gradient(180deg, #2a2a4a, #1a1a3a);
+  padding: 3px 8px;
+  display: flex; align-items: center; gap: 4px;
+  border-bottom: 1px solid var(--wa-border);
+}
+.wa-panel-tab {
+  background: transparent; border: none;
+  font-size: 9px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: 1px; color: #666; cursor: pointer;
+  padding: 3px 8px; border-radius: 3px;
+  transition: all 0.15s;
+}
+.wa-panel-tab:hover { color: #aaa; }
+.wa-panel-tab.active {
+  background: rgba(0,255,100,0.15);
+  color: var(--wa-green);
+}
+.wa-panel-tabs .wa-playlist-count {
+  margin-left: auto;
+  font-size: 9px; color: var(--wa-green2);
+  font-family: 'Courier New', monospace;
+}
+
+/* ===== SONIC MAP ===== */
+.wa-sonic-map {
+  flex: 1; position: relative;
+  background: #050510;
+  overflow: hidden;
+}
+.wa-sonic-map.hidden { display: none; }
+#sonic-map-canvas {
+  width: 100%; height: 100%;
+  cursor: crosshair;
+}
+.sonic-map-tooltip {
+  position: absolute;
+  background: rgba(0,0,0,0.9);
+  border: 1px solid var(--wa-green);
+  color: var(--wa-green);
+  font-size: 10px; padding: 4px 8px;
+  border-radius: 4px;
+  pointer-events: none;
+  display: none; white-space: nowrap;
+  z-index: 100;
+}
+.sonic-map-legend {
+  position: absolute; bottom: 6px; left: 6px;
+  font-size: 8px; color: #666;
+  display: flex; gap: 8px; align-items: center;
+}
+.legend-dot {
+  display: inline-block;
+  width: 8px; height: 8px;
+  border-radius: 50%;
+}
+.legend-dot.current { background: #ff3366; box-shadow: 0 0 6px #ff3366; }
+.legend-dot.queued { background: var(--wa-green); }
+.legend-dot.other { background: #334; }
+
 /* ===== SIMILAR BUTTON ===== */
 .similar-btn {
   background: none; border: none; cursor: pointer;
@@ -1876,6 +2441,17 @@ input[type="checkbox"] {
 </style>
 </head>
 <body>
+<!-- Track context menu (right-click) -->
+<div class="track-context-menu" id="track-context-menu">
+  <button data-action="play">&#9654; Play Now</button>
+  <button data-action="queue-next">Add to Queue (Next)</button>
+  <hr>
+  <button data-action="flow-from">&#127919; Start Flow from here</button>
+  <button data-action="dj-from">&#127911; Start DJ from here</button>
+  <hr>
+  <button data-action="similar">&#8776; Find Similar</button>
+</div>
+
 <div class="page-layout">
 
 <!-- ============ MAIN CONTENT (left) ============ -->
@@ -1913,7 +2489,12 @@ input[type="checkbox"] {
         <button data-shuffle="random" class="active">Random</button>
         <button data-shuffle="flow">Flow (smooth transitions)</button>
         <button data-shuffle="anticluster">Anti-cluster (variety)</button>
-        <button data-shuffle="dj" disabled title="Needs segment embeddings">DJ Mode (coming soon)</button>
+        <button data-shuffle="dj">DJ Mode (end-to-start matching)</button>
+        <hr style="margin:0.3rem 0;border-color:var(--border)">
+        <button data-shuffle="trajectory" data-arc="rise">&#128200; Energy Rise</button>
+        <button data-shuffle="trajectory" data-arc="fall">&#128201; Energy Fall</button>
+        <button data-shuffle="trajectory" data-arc="peak">&#127881; Peak (build &amp; drop)</button>
+        <button data-shuffle="trajectory" data-arc="chill">&#127769; Chill (low energy)</button>
       </div>
     </div>
     <button class="btn primary" id="btn-download">Download Selected</button>
@@ -1923,7 +2504,8 @@ input[type="checkbox"] {
 
   <div class="semantic-row" id="semantic-row" style="display:none">
     <input type="text" id="semantic-input" placeholder="Describe a vibe... (e.g. &quot;dark techno heavy bass&quot;, &quot;melodic ambient&quot;)">
-    <button class="btn sm" id="btn-semantic">Semantic Search</button>
+    <button class="btn sm" id="btn-semantic">Search</button>
+    <button class="btn sm" id="btn-vibe-flow" style="background:var(--accent);color:#000" title="Find matching track and start Flow from there">&#127919; Vibe Flow</button>
   </div>
 
   <div class="progress-panel" id="progress-panel">
@@ -1971,8 +2553,10 @@ input[type="checkbox"] {
   </div>
 
   <!-- Visualizer -->
-  <div class="wa-visualizer">
+  <div class="wa-visualizer" id="wa-visualizer">
     <canvas id="wa-viz-canvas"></canvas>
+    <button class="wa-viz-fullscreen-btn" id="wa-viz-fullscreen">&#x26F6; FULLSCREEN</button>
+    <div class="wa-viz-mode-label" id="wa-viz-mode-label">BARS</div>
   </div>
 
   <!-- LCD display -->
@@ -2013,14 +2597,29 @@ input[type="checkbox"] {
     <div class="wa-mode-btn" id="wa-shuffle" title="Shuffle">SHUF</div>
     <div class="wa-mode-btn" id="wa-repeat" title="Repeat all">REP</div>
     <div class="wa-mode-btn" id="wa-repeat-one" title="Repeat one">REP1</div>
+    <div class="wa-mode-btn" id="wa-adaptive" title="Adaptive Flow: next track is always most similar to current">FLOW</div>
+  </div>
+
+  <!-- Playlist/Map tabs -->
+  <div class="wa-panel-tabs">
+    <button class="wa-panel-tab active" data-panel="playlist">Playlist</button>
+    <button class="wa-panel-tab" data-panel="map">Sonic Map</button>
+    <span class="wa-playlist-count" id="wa-pl-count">0 tracks</span>
   </div>
 
   <!-- Playlist panel -->
-  <div class="wa-playlist-header">
-    <span>Playlist</span>
-    <span class="wa-playlist-count" id="wa-pl-count">0 tracks</span>
-  </div>
   <div class="wa-playlist" id="wa-playlist"></div>
+
+  <!-- Sonic Map panel -->
+  <div class="wa-sonic-map hidden" id="wa-sonic-map">
+    <canvas id="sonic-map-canvas"></canvas>
+    <div class="sonic-map-tooltip" id="sonic-map-tooltip"></div>
+    <div class="sonic-map-legend">
+      <span class="legend-dot current"></span> Current
+      <span class="legend-dot queued"></span> Queued
+      <span class="legend-dot other"></span> Library
+    </div>
+  </div>
 </div>
 
 <!-- Toggle tab -->
@@ -2278,6 +2877,65 @@ input[type="checkbox"] {
     }
   });
 
+  // Right-click context menu
+  const ctxMenu = $('track-context-menu');
+  let ctxTrack = null;
+
+  tbody.addEventListener('contextmenu', e => {
+    const tr = e.target.closest('tr');
+    if (!tr) return;
+    e.preventDefault();
+    const id = tr.dataset.id;
+    ctxTrack = allTracks.find(t => t.id === id);
+    if (!ctxTrack) return;
+
+    // Position menu at cursor
+    ctxMenu.style.left = e.clientX + 'px';
+    ctxMenu.style.top = e.clientY + 'px';
+    ctxMenu.classList.add('visible');
+
+    // Enable/disable play button based on status
+    const playBtn = ctxMenu.querySelector('[data-action="play"]');
+    const queueBtn = ctxMenu.querySelector('[data-action="queue-next"]');
+    const flowBtn = ctxMenu.querySelector('[data-action="flow-from"]');
+    const djBtn = ctxMenu.querySelector('[data-action="dj-from"]');
+    const isDownloaded = ctxTrack.status === 'downloaded';
+    if (playBtn) playBtn.disabled = !isDownloaded;
+    if (queueBtn) queueBtn.disabled = !isDownloaded;
+    if (flowBtn) flowBtn.disabled = !isDownloaded;
+    if (djBtn) djBtn.disabled = !isDownloaded;
+  });
+
+  // Hide context menu on click elsewhere
+  document.addEventListener('click', () => {
+    ctxMenu.classList.remove('visible');
+  });
+
+  // Context menu actions
+  ctxMenu.addEventListener('click', async e => {
+    const btn = e.target.closest('button');
+    if (!btn || btn.disabled || !ctxTrack) return;
+    const action = btn.dataset.action;
+    ctxMenu.classList.remove('visible');
+
+    if (action === 'play') {
+      player.playNow(ctxTrack);
+    } else if (action === 'queue-next') {
+      // Insert after current index
+      const idx = player.currentIndex >= 0 ? player.currentIndex + 1 : 0;
+      player.queue.splice(idx, 0, ctxTrack);
+      player.renderQueue();
+    } else if (action === 'flow-from') {
+      // Start Flow shuffle with this track as seed
+      await queueAllWithShuffle('flow', ctxTrack.id, 'none');
+    } else if (action === 'dj-from') {
+      // Start DJ mode with this track as seed
+      await queueAllWithShuffle('dj', ctxTrack.id, 'none');
+    } else if (action === 'similar') {
+      fetchSimilar(ctxTrack.id);
+    }
+  });
+
   $('check-all').addEventListener('change', e => {
     const vis = visibleTracks();
     if (e.target.checked) vis.forEach(t => selected.add(t.id));
@@ -2311,13 +2969,16 @@ input[type="checkbox"] {
   });
 
   // Handle shuffle mode selection
+  let energyArc = 'none';
   shuffleMenu.querySelectorAll('button').forEach(btn => {
     btn.addEventListener('click', async (e) => {
       e.stopPropagation();
       if (btn.disabled) return;
 
       const mode = btn.dataset.shuffle;
+      const arc = btn.dataset.arc || 'none';
       shuffleMode = mode;
+      energyArc = arc;
 
       // Update active state
       shuffleMenu.querySelectorAll('button').forEach(b => b.classList.remove('active'));
@@ -2325,11 +2986,11 @@ input[type="checkbox"] {
 
       // Close menu and queue tracks
       shuffleDropdown.classList.remove('open');
-      await queueAllWithShuffle(mode);
+      await queueAllWithShuffle(mode, null, arc);
     });
   });
 
-  async function queueAllWithShuffle(mode) {
+  async function queueAllWithShuffle(mode, seed = null, arc = 'none') {
     const downloaded = allTracks.filter(t => t.status === 'downloaded');
     if (downloaded.length === 0) {
       alert('No downloaded tracks to queue!');
@@ -2341,7 +3002,15 @@ input[type="checkbox"] {
     btnQueueAll.innerHTML = '&#8987; Shuffling...';
 
     try {
-      const resp = await fetch(`/api/smart-shuffle?mode=${mode}&ids=${ids.join(',')}`);
+      const body = {mode: mode, ids: ids};
+      if (seed) body.seed = seed;
+      if (arc && arc !== 'none') body.energy_arc = arc;
+
+      const resp = await fetch('/api/smart-shuffle', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(body)
+      });
       const data = await resp.json();
 
       if (data.error) {
@@ -2352,13 +3021,12 @@ input[type="checkbox"] {
       // Create track map for quick lookup
       const trackMap = Object.fromEntries(downloaded.map(t => [t.id, t]));
 
-      // Queue tracks in returned order
-      player.queue = [];
-      data.order.forEach(id => {
-        if (trackMap[id]) {
-          player.addToQueue(trackMap[id]);
-        }
-      });
+      // Queue tracks in returned order (batch for performance)
+      player.playlist = [];
+      const tracksToAdd = data.order
+        .filter(id => trackMap[id])
+        .map(id => trackMap[id]);
+      player.addBatchToQueue(tracksToAdd);
 
       // Start playing from the beginning
       if (!player.currentTrack) {
@@ -2366,8 +3034,13 @@ input[type="checkbox"] {
         player.loadAndPlay();
       }
 
-      const modeNames = {random: 'Random', flow: 'Flow', anticluster: 'Variety'};
-      btnQueueAll.innerHTML = `&#10003; ${data.order.length} (${modeNames[data.mode] || data.mode})`;
+      const modeNames = {random: 'Random', flow: 'Flow', anticluster: 'Variety', dj: 'DJ', trajectory: 'Energy'};
+      let label = modeNames[data.mode] || data.mode;
+      if (data.energy_arc && data.energy_arc !== 'none') {
+        const arcNames = {rise: '↗', fall: '↘', peak: '⛰', chill: '🌙'};
+        label += ' ' + (arcNames[data.energy_arc] || data.energy_arc);
+      }
+      btnQueueAll.innerHTML = `&#10003; ${data.order.length} (${label})`;
       if (data.message) console.log('Shuffle:', data.message);
     } catch (err) {
       console.error('Shuffle error:', err);
@@ -2565,6 +3238,8 @@ input[type="checkbox"] {
     shuffle: false,
     repeat: false,      // repeat all
     repeatOne: false,
+    adaptive: false,    // adaptive flow mode
+    playedInSession: new Set(),  // tracks already played (for adaptive mode)
     seeking: false,
     vizAnimId: null,
 
@@ -2615,6 +3290,15 @@ input[type="checkbox"] {
         $('wa-repeat-one').classList.toggle('on', this.repeatOne);
         $('wa-repeat').classList.toggle('on', this.repeat);
       });
+      $('wa-adaptive').addEventListener('click', () => {
+        this.adaptive = !this.adaptive;
+        $('wa-adaptive').classList.toggle('on', this.adaptive);
+        if (this.adaptive) {
+          // In adaptive mode, disable regular shuffle
+          this.shuffle = false;
+          $('wa-shuffle').classList.remove('on');
+        }
+      });
 
       // Toggle sidebar
       $('wa-toggle').addEventListener('click', () => this.toggleSidebar());
@@ -2635,14 +3319,38 @@ input[type="checkbox"] {
     initVisualizer() {
       this.vizCanvas = $('wa-viz-canvas');
       this.vizCtx = this.vizCanvas.getContext('2d');
-      this.vizMode = 0; // 0=bars, 1=wave, 2=circular, 3=particles
-      this.vizModes = ['bars', 'wave', 'circular', 'particles'];
+      this.vizMode = 0;
+      this.vizModes = ['bars', 'wave', 'circular', 'particles', 'kaleidoscope', 'nebula', 'matrix'];
       this.particles = [];
+      this.vizContainer = $('wa-visualizer');
+      this.vizModeLabel = $('wa-viz-mode-label');
+      this.isFullscreen = false;
 
-      // Click to change viz mode
-      this.vizCanvas.addEventListener('click', () => {
+      // Click canvas to change viz mode
+      this.vizCanvas.addEventListener('click', (e) => {
+        if (e.target.tagName === 'BUTTON') return;
         this.vizMode = (this.vizMode + 1) % this.vizModes.length;
+        this.vizModeLabel.textContent = this.vizModes[this.vizMode].toUpperCase();
       });
+
+      // Fullscreen button
+      $('wa-viz-fullscreen').addEventListener('click', (e) => {
+        e.stopPropagation();
+        this.toggleVizFullscreen();
+      });
+
+      // ESC to exit fullscreen
+      document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && this.isFullscreen) {
+          this.toggleVizFullscreen();
+        }
+      });
+    },
+
+    toggleVizFullscreen() {
+      this.isFullscreen = !this.isFullscreen;
+      this.vizContainer.classList.toggle('fullscreen', this.isFullscreen);
+      $('wa-viz-fullscreen').innerHTML = this.isFullscreen ? '&#10005; EXIT' : '&#x26F6; FULLSCREEN';
     },
 
     ensureAudioContext() {
@@ -2867,6 +3575,156 @@ input[type="checkbox"] {
         }
       };
 
+      // Kaleidoscope - mirrored psychedelic patterns
+      let kAngle = 0;
+      const drawKaleidoscope = (w, h) => {
+        const cx = w / 2, cy = h / 2;
+        const segments = 8;
+        kAngle += 0.01;
+
+        // Get overall energy
+        let energy = 0;
+        for (let i = 0; i < freqBufLen; i++) energy += freqData[i];
+        energy = energy / freqBufLen / 255;
+
+        ctx.save();
+        ctx.translate(cx, cy);
+
+        for (let seg = 0; seg < segments; seg++) {
+          ctx.save();
+          ctx.rotate((seg / segments) * Math.PI * 2);
+          if (seg % 2) ctx.scale(1, -1); // Mirror alternate segments
+
+          // Draw frequency-driven shapes
+          for (let i = 0; i < 32; i++) {
+            const val = freqData[i * 4] / 255;
+            const dist = 20 + i * 8 + val * 60;
+            const size = 3 + val * 15;
+            const angle = kAngle + i * 0.2 + val * 0.5;
+
+            const x = Math.cos(angle) * dist;
+            const y = Math.sin(angle) * dist * 0.3;
+            const hue = (i * 11 + hueShift) % 360;
+
+            ctx.beginPath();
+            ctx.arc(x, y, size, 0, Math.PI * 2);
+            ctx.fillStyle = `hsla(${hue}, 100%, 60%, ${0.3 + val * 0.5})`;
+            ctx.shadowBlur = 20;
+            ctx.shadowColor = `hsla(${hue}, 100%, 50%, 0.8)`;
+            ctx.fill();
+          }
+          ctx.restore();
+        }
+        ctx.restore();
+        ctx.shadowBlur = 0;
+      };
+
+      // Nebula - cosmic clouds
+      const stars = [];
+      for (let i = 0; i < 100; i++) {
+        stars.push({x: Math.random(), y: Math.random(), s: Math.random() * 2 + 0.5, b: Math.random()});
+      }
+      let nebulaTime = 0;
+      const drawNebula = (w, h) => {
+        nebulaTime += 0.02;
+
+        // Get bass and treble
+        let bass = 0, treble = 0;
+        for (let i = 0; i < 8; i++) bass += freqData[i];
+        for (let i = freqBufLen - 16; i < freqBufLen; i++) treble += freqData[i];
+        bass = bass / 8 / 255;
+        treble = treble / 16 / 255;
+
+        // Draw twinkling stars
+        stars.forEach(star => {
+          const twinkle = 0.3 + Math.sin(nebulaTime * 3 + star.b * 10) * 0.3 + treble * 0.4;
+          ctx.beginPath();
+          ctx.arc(star.x * w, star.y * h, star.s * (1 + treble), 0, Math.PI * 2);
+          ctx.fillStyle = `rgba(255, 255, 255, ${twinkle})`;
+          ctx.fill();
+        });
+
+        // Draw nebula clouds
+        const cx = w / 2, cy = h / 2;
+        for (let layer = 0; layer < 3; layer++) {
+          const grad = ctx.createRadialGradient(
+            cx + Math.sin(nebulaTime + layer) * 50 * bass,
+            cy + Math.cos(nebulaTime * 0.7 + layer) * 30 * bass,
+            0,
+            cx, cy, Math.min(w, h) * 0.6
+          );
+          const hue = (layer * 120 + nebulaTime * 20) % 360;
+          grad.addColorStop(0, `hsla(${hue}, 100%, 50%, ${0.1 + bass * 0.3})`);
+          grad.addColorStop(0.5, `hsla(${hue + 30}, 80%, 40%, ${0.05 + bass * 0.1})`);
+          grad.addColorStop(1, 'transparent');
+          ctx.fillStyle = grad;
+          ctx.fillRect(0, 0, w, h);
+        }
+
+        // Draw pulsing central orb
+        const orbSize = 30 + bass * 80;
+        const orbGrad = ctx.createRadialGradient(cx, cy, 0, cx, cy, orbSize);
+        orbGrad.addColorStop(0, `rgba(255, 220, 100, ${0.8 + bass * 0.2})`);
+        orbGrad.addColorStop(0.3, `rgba(255, 100, 50, ${0.4 + bass * 0.3})`);
+        orbGrad.addColorStop(1, 'transparent');
+        ctx.fillStyle = orbGrad;
+        ctx.beginPath();
+        ctx.arc(cx, cy, orbSize, 0, Math.PI * 2);
+        ctx.fill();
+      };
+
+      // Matrix - falling code rain
+      const columns = [];
+      const matrixChars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789@#$%&*';
+      const drawMatrix = (w, h) => {
+        const colWidth = 14;
+        const numCols = Math.ceil(w / colWidth);
+
+        // Initialize columns
+        while (columns.length < numCols) {
+          columns.push({y: Math.random() * -100, speed: 2 + Math.random() * 5, chars: []});
+        }
+
+        // Get energy for effects
+        let energy = 0;
+        for (let i = 0; i < 32; i++) energy += freqData[i];
+        energy = energy / 32 / 255;
+
+        ctx.font = '12px monospace';
+
+        columns.forEach((col, i) => {
+          // Update position
+          col.y += col.speed * (0.5 + energy * 1.5);
+          if (col.y > h + 100) {
+            col.y = Math.random() * -50;
+            col.speed = 2 + Math.random() * 5;
+          }
+
+          // Draw characters
+          const x = i * colWidth;
+          const charCount = 15;
+          for (let j = 0; j < charCount; j++) {
+            const y = col.y - j * 14;
+            if (y < 0 || y > h) continue;
+
+            const char = matrixChars[Math.floor(Math.random() * matrixChars.length)];
+            const brightness = 1 - (j / charCount);
+            const hue = 80 + energy * 40; // Green to yellow with energy
+
+            if (j === 0) {
+              ctx.fillStyle = `rgba(255, 255, 255, ${0.9 + energy * 0.1})`;
+              ctx.shadowBlur = 15;
+              ctx.shadowColor = `hsl(${hue}, 100%, 70%)`;
+            } else {
+              ctx.fillStyle = `hsla(${hue}, 100%, ${40 + brightness * 30}%, ${brightness * 0.8})`;
+              ctx.shadowBlur = 0;
+            }
+            ctx.fillText(char, x, y);
+          }
+        });
+        ctx.shadowBlur = 0;
+      };
+
       const draw = () => {
         self.vizAnimId = requestAnimationFrame(draw);
         const w = canvas.width = canvas.clientWidth * 2;
@@ -2876,8 +3734,9 @@ input[type="checkbox"] {
 
         analyser.getByteFrequencyData(freqData);
 
-        // Clear with fade for trails
-        ctx.fillStyle = self.vizMode === 3 ? 'rgba(0,0,0,0.15)' : 'rgba(0,0,0,0.4)';
+        // Clear with fade for trails (different fade rates per mode)
+        const fadeRates = [0.4, 0.4, 0.4, 0.15, 0.08, 0.12, 0.7];
+        ctx.fillStyle = `rgba(0,0,0,${fadeRates[self.vizMode] || 0.4})`;
         ctx.fillRect(0, 0, w, h);
 
         // Draw based on mode
@@ -2886,12 +3745,10 @@ input[type="checkbox"] {
           case 1: drawWave(w, h); break;
           case 2: drawCircular(w, h); break;
           case 3: drawParticles(w, h); break;
+          case 4: drawKaleidoscope(w, h); break;
+          case 5: drawNebula(w, h); break;
+          case 6: drawMatrix(w, h); break;
         }
-
-        // Mode indicator
-        ctx.fillStyle = 'rgba(240, 225, 48, 0.5)';
-        ctx.font = '16px monospace';
-        ctx.fillText(self.vizModes[self.vizMode].toUpperCase(), 10, 20);
       };
       draw();
     },
@@ -2908,17 +3765,33 @@ input[type="checkbox"] {
       this.loadAndPlay();
     },
 
-    addToQueue(track) {
+    addToQueue(track, skipRender = false) {
       if (!this.playlist.find(t => t.id === track.id)) {
         this.playlist.push({id: track.id, title: track.title});
-        this.renderPlaylist();
+        if (!skipRender) this.renderPlaylist();
       }
+    },
+
+    // Batch add for performance - renders only once at the end
+    addBatchToQueue(tracks) {
+      const existingIds = new Set(this.playlist.map(t => t.id));
+      for (const track of tracks) {
+        if (!existingIds.has(track.id)) {
+          this.playlist.push({id: track.id, title: track.title});
+          existingIds.add(track.id);
+        }
+      }
+      this.renderPlaylist();
     },
 
     loadAndPlay() {
       const track = this.playlist[this.currentIndex];
       if (!track) return;
       this.currentTrack = track;
+
+      // Track for adaptive mode
+      this.playedInSession.add(track.id);
+
       this.audio.src = `/api/audio/${track.id}`;
       this.audio.load();
 
@@ -2962,8 +3835,40 @@ input[type="checkbox"] {
       $('wa-seek').value = 0;
     },
 
-    next() {
+    async next() {
       if (!this.playlist.length) return;
+
+      // Adaptive Flow mode: find most similar track via API
+      if (this.adaptive && this.currentTrack) {
+        try {
+          const exclude = Array.from(this.playedInSession);
+          const resp = await fetch('/api/next-similar', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({current: this.currentTrack.id, exclude: exclude})
+          });
+          const data = await resp.json();
+
+          if (data.next) {
+            // Find or add track to playlist
+            let idx = this.playlist.findIndex(t => t.id === data.next.id);
+            if (idx === -1) {
+              // Add to playlist if not there
+              this.playlist.push(data.next);
+              idx = this.playlist.length - 1;
+              this.renderPlaylist();
+            }
+            this.currentIndex = idx;
+            this.loadAndPlay();
+            return;
+          }
+          // Fall through to normal behavior if no similar found
+        } catch (err) {
+          console.error('Adaptive mode error:', err);
+          // Fall through to normal behavior
+        }
+      }
+
       if (this.shuffle) {
         this.currentIndex = Math.floor(Math.random() * this.playlist.length);
       } else {
@@ -3045,6 +3950,9 @@ input[type="checkbox"] {
       // Scroll current into view
       const cur = el.querySelector('.current');
       if (cur) cur.scrollIntoView({block: 'nearest'});
+
+      // Update sonic map
+      if (typeof sonicMap !== 'undefined') sonicMap.onPlaylistChange();
     },
 
     removeFromPlaylist(index) {
@@ -3359,8 +4267,234 @@ input[type="checkbox"] {
     if (e.key === 'Enter') doSemanticSearch($('semantic-input').value);
   });
 
+  // Vibe Flow: semantic search + Flow shuffle
+  async function doVibeFlow(prompt) {
+    if (!prompt.trim()) {
+      alert('Enter a vibe description first!');
+      return;
+    }
+    const btn = $('btn-vibe-flow');
+    btn.disabled = true;
+    btn.innerHTML = '&#8987; Finding vibe...';
+
+    try {
+      const resp = await fetch('/api/vibe-flow', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({prompt: prompt})
+      });
+      const data = await resp.json();
+
+      if (data.error) {
+        alert('Vibe Flow failed: ' + data.error);
+        return;
+      }
+
+      // Build track map from all tracks
+      const downloaded = allTracks.filter(t => t.status === 'downloaded');
+      const trackMap = Object.fromEntries(downloaded.map(t => [t.id, t]));
+
+      // Queue tracks in returned order
+      player.queue = [];
+      data.order.forEach(id => {
+        if (trackMap[id]) player.addToQueue(trackMap[id]);
+      });
+
+      // Start playing
+      if (!player.currentTrack) {
+        player.currentIndex = 0;
+        player.loadAndPlay();
+      }
+
+      btn.innerHTML = `&#10003; ${data.order.length} from "${prompt.slice(0, 20)}..."`;
+    } catch (err) {
+      console.error('Vibe Flow error:', err);
+      alert('Vibe Flow failed: ' + err.message);
+    } finally {
+      setTimeout(() => {
+        btn.disabled = false;
+        btn.innerHTML = '&#127919; Vibe Flow';
+      }, 3000);
+    }
+  }
+
+  $('btn-vibe-flow').addEventListener('click', () => {
+    doVibeFlow($('semantic-input').value);
+  });
+
+  /* ==================================================================
+     SONIC MAP - 2D visualization of latent space
+     ================================================================== */
+  const sonicMap = {
+    canvas: null,
+    ctx: null,
+    tracks: [],  // {id, title, x, y}
+    trackMap: {}, // id -> track
+    loaded: false,
+    hoverTrack: null,
+
+    init() {
+      this.canvas = $('sonic-map-canvas');
+      if (!this.canvas) return;
+      this.ctx = this.canvas.getContext('2d');
+
+      // Tab switching
+      document.querySelectorAll('.wa-panel-tab').forEach(tab => {
+        tab.addEventListener('click', () => {
+          document.querySelectorAll('.wa-panel-tab').forEach(t => t.classList.remove('active'));
+          tab.classList.add('active');
+          const panel = tab.dataset.panel;
+          $('wa-playlist').classList.toggle('hidden', panel !== 'playlist');
+          $('wa-sonic-map').classList.toggle('hidden', panel !== 'map');
+          if (panel === 'map' && !this.loaded) this.load();
+          if (panel === 'map') this.render();
+        });
+      });
+
+      // Mouse events
+      this.canvas.addEventListener('mousemove', e => this.onMouseMove(e));
+      this.canvas.addEventListener('mouseleave', () => this.hideTooltip());
+      this.canvas.addEventListener('click', e => this.onClick(e));
+
+      // Resize handler
+      new ResizeObserver(() => { if (this.loaded) this.render(); }).observe(this.canvas.parentElement);
+    },
+
+    async load() {
+      try {
+        const resp = await fetch('/api/sonic-map');
+        const data = await resp.json();
+        if (data.available && data.tracks) {
+          this.tracks = data.tracks;
+          this.trackMap = {};
+          this.tracks.forEach(t => this.trackMap[t.id] = t);
+          this.loaded = true;
+          this.render();
+        }
+      } catch (err) { console.error('Sonic map load error:', err); }
+    },
+
+    render() {
+      if (!this.ctx || !this.tracks.length) return;
+      const rect = this.canvas.parentElement.getBoundingClientRect();
+      this.canvas.width = rect.width;
+      this.canvas.height = rect.height;
+      const ctx = this.ctx;
+      const w = this.canvas.width, h = this.canvas.height;
+      const pad = 20;
+
+      // Clear
+      ctx.fillStyle = '#050510';
+      ctx.fillRect(0, 0, w, h);
+
+      // Get current and queued track IDs
+      const currentId = player.currentTrack ? player.currentTrack.id : null;
+      const queuedIds = new Set(player.playlist.map(t => t.id));
+
+      // Draw queue path
+      if (player.playlist.length > 1) {
+        ctx.beginPath();
+        ctx.strokeStyle = 'rgba(0,255,100,0.3)';
+        ctx.lineWidth = 1;
+        let first = true;
+        for (const pt of player.playlist) {
+          const t = this.trackMap[pt.id];
+          if (!t) continue;
+          const x = pad + t.x * (w - 2*pad);
+          const y = pad + t.y * (h - 2*pad);
+          if (first) { ctx.moveTo(x, y); first = false; }
+          else ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+      }
+
+      // Draw all tracks
+      for (const t of this.tracks) {
+        const x = pad + t.x * (w - 2*pad);
+        const y = pad + t.y * (h - 2*pad);
+        const isCurrent = t.id === currentId;
+        const isQueued = queuedIds.has(t.id);
+
+        ctx.beginPath();
+        if (isCurrent) {
+          ctx.fillStyle = '#ff3366';
+          ctx.shadowColor = '#ff3366';
+          ctx.shadowBlur = 8;
+          ctx.arc(x, y, 6, 0, Math.PI * 2);
+        } else if (isQueued) {
+          ctx.fillStyle = '#00ff66';
+          ctx.shadowColor = '#00ff66';
+          ctx.shadowBlur = 4;
+          ctx.arc(x, y, 4, 0, Math.PI * 2);
+        } else {
+          ctx.fillStyle = '#334';
+          ctx.shadowBlur = 0;
+          ctx.arc(x, y, 2.5, 0, Math.PI * 2);
+        }
+        ctx.fill();
+        ctx.shadowBlur = 0;
+      }
+    },
+
+    getTrackAt(x, y) {
+      const rect = this.canvas.getBoundingClientRect();
+      const mx = x - rect.left, my = y - rect.top;
+      const w = this.canvas.width, h = this.canvas.height;
+      const pad = 20;
+      for (const t of this.tracks) {
+        const tx = pad + t.x * (w - 2*pad);
+        const ty = pad + t.y * (h - 2*pad);
+        const dist = Math.sqrt((mx - tx)**2 + (my - ty)**2);
+        if (dist < 10) return t;
+      }
+      return null;
+    },
+
+    onMouseMove(e) {
+      const t = this.getTrackAt(e.clientX, e.clientY);
+      if (t) {
+        this.hoverTrack = t;
+        const tooltip = $('sonic-map-tooltip');
+        tooltip.textContent = t.title;
+        tooltip.style.display = 'block';
+        const rect = this.canvas.getBoundingClientRect();
+        tooltip.style.left = (e.clientX - rect.left + 10) + 'px';
+        tooltip.style.top = (e.clientY - rect.top - 20) + 'px';
+      } else {
+        this.hideTooltip();
+      }
+    },
+
+    hideTooltip() {
+      this.hoverTrack = null;
+      $('sonic-map-tooltip').style.display = 'none';
+    },
+
+    onClick(e) {
+      const t = this.getTrackAt(e.clientX, e.clientY);
+      if (t) {
+        // Add to queue and play
+        player.addToQueue({id: t.id, title: t.title});
+        const idx = player.playlist.findIndex(pt => pt.id === t.id);
+        if (idx >= 0) {
+          player.currentIndex = idx;
+          player.loadAndPlay();
+        }
+        this.render();
+      }
+    },
+
+    // Re-render when playlist changes
+    onPlaylistChange() {
+      if (this.loaded && !$('wa-sonic-map').classList.contains('hidden')) {
+        this.render();
+      }
+    }
+  };
+
   // ---- Init ----
   player.init();
+  sonicMap.init();
   fetchConfig();
   fetchTracks();
   connectSSE();
@@ -3387,6 +4521,8 @@ def main():
                         help="Override playlist URL")
     parser.add_argument("--auto-fetch", action="store_true",
                         help="Automatically fetch YouTube playlist on startup (default: local only)")
+    parser.add_argument("--auto-embed", action="store_true",
+                        help="Automatically embed new audio files on startup")
     args = parser.parse_args()
 
     output_dir = Path(args.output)
@@ -3400,7 +4536,10 @@ def main():
     # Load completed and failed progress immediately (fast, local files)
     app_state["completed"] = load_progress(output_dir)
     app_state["failed"] = load_failed(output_dir)
-    print(f"Already completed: {len(app_state['completed'])}, previously failed: {len(app_state['failed'])}")
+
+    # Scan local library on startup
+    local_tracks = scan_downloaded_tracks()
+    print(f"Local library: {len(local_tracks)} tracks ready to play")
 
     def fetch_playlist_async():
         """Fetch playlist in background so UI can load immediately."""
@@ -3446,6 +4585,53 @@ def main():
         threading.Thread(target=fetch_playlist_async, daemon=True).start()
     else:
         print("Local mode: use 'Load Playlist' button in UI to fetch from YouTube")
+
+    # Auto-embed new music files on startup
+    def check_and_embed_new_files():
+        """Check for new audio files and start embedding them."""
+        if not _HAS_RECOMMENDER:
+            return
+
+        try:
+            from recommender import find_audio_files, load_segment_embeddings, cmd_embed_segments
+            import argparse as _argparse
+
+            audio_files = find_audio_files(output_dir)
+            if not audio_files:
+                return
+
+            # Check what's already embedded
+            seg_data = load_segment_embeddings(output_dir)
+            embedded_ids = set(seg_data["ids"]) if seg_data else set()
+
+            # Find new files
+            new_files = [(vid, p) for vid, p in audio_files if vid not in embedded_ids]
+            if not new_files:
+                print(f"All {len(audio_files)} audio files already embedded.")
+                return
+
+            print(f"\nFound {len(new_files)} new audio files to embed (of {len(audio_files)} total)")
+            broadcast_sse("embedding_started", {"new_count": len(new_files), "total_count": len(audio_files)})
+
+            # Create args object for cmd_embed_segments
+            embed_args = _argparse.Namespace(
+                output=str(output_dir),
+                device="cuda"
+            )
+
+            # Run embedding (this will take a while)
+            cmd_embed_segments(embed_args)
+
+            print("Embedding complete!")
+            broadcast_sse("embedding_complete", {"count": len(new_files)})
+
+        except Exception as e:
+            print(f"Auto-embedding error: {e}")
+            broadcast_sse("embedding_error", {"error": str(e)})
+
+    if args.auto_embed:
+        print("Auto-embedding enabled, checking for new files...")
+        threading.Thread(target=check_and_embed_new_files, daemon=True).start()
 
     if not args.no_browser:
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()

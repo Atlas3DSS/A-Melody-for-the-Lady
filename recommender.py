@@ -75,14 +75,28 @@ def extract_video_id(filename: str) -> str | None:
     return match.group(1) if match else None
 
 
+def generate_file_id(filepath: Path) -> str:
+    """Generate a stable ID for a file without a video ID, using filename hash."""
+    import hashlib
+    # Use stem (filename without extension) for hash
+    stem = filepath.stem
+    h = hashlib.md5(stem.encode('utf-8')).hexdigest()[:11]
+    return f"local_{h}"
+
+
 def find_audio_files(music_dir: Path) -> list[tuple[str, Path]]:
-    """Return list of (video_id, path) for all audio files."""
+    """Return list of (file_id, path) for all audio files.
+
+    For YouTube downloads with [video_id] in filename, uses that ID.
+    For other files, generates a stable hash-based ID.
+    """
     results = []
     for f in sorted(music_dir.iterdir()):
-        if f.suffix in AUDIO_EXTENSIONS:
+        if f.suffix.lower() in AUDIO_EXTENSIONS:
             vid_id = extract_video_id(f.name)
-            if vid_id:
-                results.append((vid_id, f))
+            if not vid_id:
+                vid_id = generate_file_id(f)
+            results.append((vid_id, f))
     return results
 
 
@@ -807,6 +821,45 @@ def cmd_embed(args):
     print(f"  CLAP dims: {all_clap.shape if len(all_clap) else 'empty'}")
 
 
+def _save_checkpoint(music_dir, existing_data, new_ids, new_titles,
+                     new_mean_emb, new_max_emb, new_std_emb,
+                     all_segment_ids, all_segment_times, all_segment_emb):
+    """Save checkpoint during embedding to avoid losing progress."""
+    if not new_ids:
+        return
+
+    # Merge with existing
+    if existing_data is not None and len(existing_data["ids"]) > 0:
+        all_ids = list(existing_data["ids"]) + new_ids
+        all_titles = list(existing_data["titles"]) + new_titles
+        all_mean = np.concatenate([existing_data["mean_emb"], np.stack(new_mean_emb)])
+        all_max = np.concatenate([existing_data["max_emb"], np.stack(new_max_emb)])
+        all_std = np.concatenate([existing_data["std_emb"], np.stack(new_std_emb)])
+        merged_seg_ids = list(existing_data["segment_ids"]) + all_segment_ids
+        merged_seg_times = np.concatenate([existing_data["segment_times"], np.stack(all_segment_times)])
+        merged_seg_emb = np.concatenate([existing_data["segment_emb"], np.stack(all_segment_emb)])
+    else:
+        all_ids = new_ids
+        all_titles = new_titles
+        all_mean = np.stack(new_mean_emb)
+        all_max = np.stack(new_max_emb)
+        all_std = np.stack(new_std_emb)
+        merged_seg_ids = all_segment_ids
+        merged_seg_times = np.stack(all_segment_times)
+        merged_seg_emb = np.stack(all_segment_emb)
+
+    save_segment_embeddings(music_dir, {
+        "ids": all_ids,
+        "titles": all_titles,
+        "mean_emb": all_mean,
+        "max_emb": all_max,
+        "std_emb": all_std,
+        "segment_ids": merged_seg_ids,
+        "segment_times": merged_seg_times,
+        "segment_emb": merged_seg_emb,
+    })
+
+
 def cmd_embed_segments(args):
     """Create segment-level embeddings for entire tracks.
 
@@ -901,6 +954,13 @@ def cmd_embed_segments(args):
         # Clear CUDA cache periodically
         if (i + 1) % 10 == 0:
             torch.cuda.empty_cache()
+
+        # Checkpoint save every 100 tracks to avoid losing progress
+        if (i + 1) % 100 == 0:
+            print(f"    [Checkpoint] Saving progress ({len(new_ids)} new tracks)...")
+            _save_checkpoint(music_dir, existing_data, new_ids, new_titles,
+                           new_mean_emb, new_max_emb, new_std_emb,
+                           all_segment_ids, all_segment_times, all_segment_emb)
 
     # Merge with existing data
     if existing_data is not None and len(existing_data["ids"]) > 0:
